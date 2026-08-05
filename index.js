@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.1';
+const STSC_VERSION = '0.4.0-beta.8';
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
 const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
@@ -25,12 +25,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-05',
-    title: '建立独立 DEV 测试环境',
+    title: '移除双阶段严格模式',
     changes: Object.freeze([
-        '基于正式版 v0.3.4 建立独立开发测试版。',
-        '测试版使用独立仓库、设置存储、界面命名空间、聊天元数据与更新地址。',
-        '正式版启用时，DEV 生成拦截器会自动保持静默，避免两套插件同时处理同一轮生成。',
-        '本版本暂未加入双 API 功能，只作为后续开发与测试基础。',
+        '正式移除容易与双API调用混淆的“双阶段严格模式”及其两次调用逻辑。',
+        '生成模式现在只保留“单API调用”和“双API调用”两种。',
+        '旧设置若曾选择双阶段严格模式，会自动安全迁移为单API调用，不影响其他设置、预设、资料库与历史自检记录。',
+        '双API调用、强力规范转化、资料库自包含问答与遗漏项跳过逻辑均保持不变。',
     ]),
 });
 
@@ -88,6 +88,16 @@ const DEFAULT_SETTINGS = Object.freeze({
         depth: 0,
         role: 'system',
     },
+    dualApi: {
+        endpoint: '',
+        apiKey: '',
+        model: '',
+        maxTokens: 2000,
+        contextMode: 'recent5',
+        customTurns: 5,
+        transformFormat: false,
+        failureMode: 'fallback_single',
+    },
     presets: [],
     references: [],
     temporaryInstructions: [],
@@ -128,7 +138,7 @@ const DEFAULT_SETTINGS = Object.freeze({
 });
 
 let pendingRun = null;
-let strictBusy = false;
+let dualApiBusy = false;
 let testBusy = false;
 let lastTestResult = '';
 let internalQuietActive = false;
@@ -154,6 +164,11 @@ let updateCheckState = 'idle';
 let updateCheckError = '';
 let lastRuntimeUpdateCheckAt = 0;
 let officialConflictWarned = false;
+let dualApiModels = [];
+let dualApiModelsLoading = false;
+let dualApiModelsError = '';
+let dualApiModelsSignature = '';
+let dualApiModelFetchTimer = null;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -192,6 +207,20 @@ function normalizeSettings() {
 
     const settings = all[STSC_MODULE];
     mergeDefaults(settings, DEFAULT_SETTINGS);
+
+    // beta.7：双阶段严格模式已移除。旧设置自动迁移为单API调用，避免保留不可执行的模式值。
+    if (settings.mode === 'strict') settings.mode = 'single';
+    settings.mode = ['single', 'dual_api'].includes(settings.mode) ? settings.mode : 'single';
+    if (!settings.dualApi || typeof settings.dualApi !== 'object') settings.dualApi = clone(DEFAULT_SETTINGS.dualApi);
+    settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
+    settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
+    settings.dualApi.model = String(settings.dualApi.model || '');
+    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 2000);
+    // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
+    settings.dualApi.contextMode = ['recent5', 'custom', 'all'].includes(settings.dualApi.contextMode) ? settings.dualApi.contextMode : 'recent5';
+    settings.dualApi.customTurns = clampNumber(settings.dualApi.customTurns, 1, 100, 5);
+    settings.dualApi.transformFormat = Boolean(settings.dualApi.transformFormat);
+    settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
 
     if (!Array.isArray(settings.presets)) settings.presets = [];
     if (!Array.isArray(settings.references)) settings.references = [];
@@ -650,6 +679,225 @@ function clampNumber(value, min, max, fallback) {
     return Math.min(max, Math.max(min, number));
 }
 
+function normalizeDualApiBaseUrl(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+
+    try {
+        const url = new URL(raw);
+        url.hash = '';
+        url.search = '';
+        let path = url.pathname.replace(/\/+$/g, '');
+        path = path
+            .replace(/\/chat\/completions$/i, '')
+            .replace(/\/responses$/i, '')
+            .replace(/\/models$/i, '');
+        url.pathname = path || '/';
+        return url.toString().replace(/\/+$/g, '');
+    } catch {
+        return '';
+    }
+}
+
+function dualApiConnectionSignature(dual = getUiSettings()?.dualApi) {
+    if (!dual) return '';
+    return `${normalizeDualApiBaseUrl(dual.endpoint)}\n${String(dual.apiKey || '')}`;
+}
+
+function extractDualApiModelIds(payload) {
+    const candidates = [
+        payload?.data,
+        payload?.data?.data,
+        payload?.models,
+        payload?.result,
+    ];
+    const list = candidates.find(value => Array.isArray(value)) || [];
+    const ids = list
+        .map(item => {
+            if (typeof item === 'string') return item;
+            if (!item || typeof item !== 'object') return '';
+            return item.id || item.name || item.model || '';
+        })
+        .map(value => String(value || '').trim())
+        .filter(Boolean);
+    return [...new Set(ids)].sort((a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }));
+}
+
+function dualApiModelOptionsHtml(dual) {
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    const savedModel = String(dual.model || '');
+
+    if (dualApiModelsLoading) {
+        return '<option value="">正在获取模型列表……</option>';
+    }
+
+    if (dualApiModels.length) {
+        return dualApiModels.map(model => `<option value="${escapeHtml(model)}" ${model === savedModel ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('');
+    }
+
+    if (!endpoint) {
+        return '<option value="">请先填写自检API地址</option>';
+    }
+
+    if (dualApiModelsError) {
+        const saved = savedModel ? `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（上次选择）</option>` : '';
+        return `${saved}<option value="" ${saved ? '' : 'selected'}>模型获取失败，请检查接口</option>`;
+    }
+
+    if (savedModel) {
+        return `<option value="${escapeHtml(savedModel)}" selected>${escapeHtml(savedModel)}（等待刷新）</option>`;
+    }
+
+    return '<option value="">模型将自动获取</option>';
+}
+
+function dualApiModelStatusText(dual) {
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    if (!endpoint) return '填写接口地址后，插件会自动读取该接口提供的模型列表。';
+    if (dualApiModelsLoading) return '正在连接接口并读取模型列表……';
+    if (dualApiModelsError) return dualApiModelsError;
+    if (dualApiModels.length) return `已获取 ${dualApiModels.length} 个可用模型。`;
+    return '等待自动获取模型列表。';
+}
+
+function updateDualApiModelControl() {
+    const settings = getUiSettings();
+    const dual = settings?.dualApi;
+    if (!dual) return;
+
+    const select = document.getElementById('stscdev_dual_model');
+    const button = document.getElementById('stscdev_refresh_models');
+    const status = document.getElementById('stscdev_dual_model_status');
+    if (!select) return;
+
+    select.innerHTML = dualApiModelOptionsHtml(dual);
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    select.disabled = !endpoint || dualApiModelsLoading || !dualApiModels.length;
+
+    if (dualApiModels.length) {
+        const selected = dualApiModels.includes(dual.model) ? dual.model : dualApiModels[0];
+        if (dual.model !== selected) {
+            dual.model = selected;
+            markDirty();
+        }
+        select.value = selected;
+    }
+
+    if (button) {
+        button.disabled = !endpoint || dualApiModelsLoading;
+        button.textContent = dualApiModelsLoading ? '获取中…' : '刷新模型';
+    }
+
+    if (status) {
+        status.textContent = dualApiModelStatusText(dual);
+        status.classList.toggle('stscdev-model-status-error', Boolean(dualApiModelsError));
+        status.classList.toggle('stscdev-model-status-success', Boolean(dualApiModels.length && !dualApiModelsError));
+    }
+}
+
+function resetDualApiModelState() {
+    dualApiModels = [];
+    dualApiModelsLoading = false;
+    dualApiModelsError = '';
+    dualApiModelsSignature = '';
+    if (dualApiModelFetchTimer) {
+        clearTimeout(dualApiModelFetchTimer);
+        dualApiModelFetchTimer = null;
+    }
+    updateDualApiModelControl();
+}
+
+function scheduleDualApiModelFetch(delay = 650, { force = false, showToast = false } = {}) {
+    if (dualApiModelFetchTimer) clearTimeout(dualApiModelFetchTimer);
+    dualApiModelFetchTimer = setTimeout(() => {
+        dualApiModelFetchTimer = null;
+        fetchDualApiModels({ force, showToast });
+    }, Math.max(0, Number(delay) || 0));
+}
+
+async function fetchDualApiModels({ force = false, showToast = false } = {}) {
+    const settings = getUiSettings();
+    const dual = settings?.dualApi;
+    if (!dual) return [];
+
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    if (!endpoint) {
+        dualApiModels = [];
+        dualApiModelsError = '';
+        dualApiModelsSignature = '';
+        updateDualApiModelControl();
+        return [];
+    }
+
+    const signature = dualApiConnectionSignature(dual);
+    if (!force && signature === dualApiModelsSignature && (dualApiModelsLoading || dualApiModels.length || dualApiModelsError)) {
+        updateDualApiModelControl();
+        return dualApiModels;
+    }
+
+    dualApiModelsLoading = true;
+    dualApiModelsError = '';
+    dualApiModelsSignature = signature;
+    updateDualApiModelControl();
+
+    try {
+        const context = ctx();
+        const headers = {
+            'Content-Type': 'application/json',
+            ...(context?.getRequestHeaders?.() || {}),
+        };
+        const response = await fetch('/api/backends/chat-completions/status', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+                chat_completion_source: 'openai',
+                reverse_proxy: endpoint,
+                proxy_password: String(dual.apiKey || ''),
+            }),
+        });
+
+        let payload = {};
+        try {
+            payload = await response.json();
+        } catch {
+            payload = {};
+        }
+
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+            return [];
+        }
+
+        const models = extractDualApiModelIds(payload);
+        if (!response.ok || payload?.error || !models.length) {
+            const message = String(payload?.message || payload?.error?.message || '').trim();
+            throw new Error(message || '没有读取到模型列表。请确认填写的是以 /v1 结尾的 OpenAI 兼容接口，并且该接口支持 /models。');
+        }
+
+        dualApiModels = models;
+        dualApiModelsError = '';
+        const liveDual = getUiSettings().dualApi;
+        if (!models.includes(liveDual.model)) {
+            liveDual.model = models[0];
+            markDirty();
+        }
+        if (showToast) toastr.success(`已获取 ${models.length} 个模型。`, '墨提斯之镜 DEV');
+        return models;
+    } catch (error) {
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) !== signature) {
+            return [];
+        }
+        dualApiModels = [];
+        dualApiModelsError = `模型获取失败：${String(error?.message || error || '未知错误')}`;
+        if (showToast) toastr.error(dualApiModelsError, '墨提斯之镜 DEV');
+        return [];
+    } finally {
+        if (dualApiConnectionSignature(getUiSettings()?.dualApi) === signature) {
+            dualApiModelsLoading = false;
+            updateDualApiModelControl();
+        }
+    }
+}
+
 function saveSettings() {
     ctx()?.saveSettingsDebounced?.();
 }
@@ -680,7 +928,7 @@ function commitEditDraft({ notify = true } = {}) {
     if (!savedSettings?.enabled) {
         // 用户关闭插件后立刻终止尚未完成的本轮检测，避免回复完成时被误判为“未输出自检”。
         pendingRun = null;
-        strictBusy = false;
+        dualApiBusy = false;
         clearRuntimePrompts();
     }
     saveSettings();
@@ -1126,6 +1374,36 @@ function makeReferenceQuestion(reference) {
     };
 }
 
+function makeDualApiReferenceQuestion(reference) {
+    const config = referenceTypeConfig(reference.type);
+    const name = reference.name || '未命名资料';
+    const textByType = {
+        style: `请根据【${name}】文风资料，完整说明本轮正文具体应如何输出，包括语言风格、句式节奏、描写重点、台词特点以及必须避免的表达。答案必须复述本轮真正需要执行的具体规则，使没有读取该资料的写作模型仅凭答案也能准确执行；不得只回答“遵照资料”“按上述要求”或使用其他模糊指代。`,
+        restriction: `请根据【${name}】限制资料，完整列出本轮必须遵守的限制、禁止出现的内容、允许保留的表现，以及正文应如何具体规避违规。答案必须复述实际限制，使没有读取该资料的写作模型也能独立执行；不得只回答“会遵守”“没有违反”或使用其他模糊指代。`,
+        other: `请根据【${name}】资料，提取与本轮剧情有关的具体信息，并完整说明这些信息将如何影响角色判断、行动、台词、剧情发展或输出格式。答案必须包含正文生成所需的实际内容，使没有读取该资料的写作模型也能独立执行；不得只引用资料名称或使用“按资料处理”等模糊指代。`,
+    };
+
+    return {
+        id: `ref_${reference.id}`,
+        text: textByType[reference.type] || textByType.other,
+        type: 'open',
+        length: 'detailed',
+        requireEvidence: true,
+        enabled: true,
+        source: `参考资料库-${config.label}-${name}`,
+        referenceId: reference.id,
+    };
+}
+
+function getDualApiQuestions(settings = normalizeSettings()) {
+    const questions = getActiveQuestions(settings).map(question => clone(question));
+    const referenceMap = new Map(getActiveReferences(settings).map(reference => [`ref_${reference.id}`, reference]));
+    return questions.map(question => {
+        const reference = referenceMap.get(question.id);
+        return reference ? makeDualApiReferenceQuestion(reference) : question;
+    });
+}
+
 function getActiveQuestions(settings = normalizeSettings()) {
     const result = [];
     const general = settings.presets.find(x => x.id === settings.generalPresetId);
@@ -1242,42 +1520,6 @@ ${buildQuestionXml(questions)}
 `.trim();
 }
 
-function buildStrictCheckPrompt(questions) {
-    return `
-这是“双阶段严格模式”的第一阶段。请只完成墨提斯之镜 DEV，不得输出角色扮演正文、对白、动作描写或状态栏。
-
-请结合当前角色卡、世界观、聊天记录和用户最后一条消息，逐题给出最终写作结论。发现潜在冲突时，先调整本轮写作计划，再给出最终答案。本阶段只规定插件自检的输出格式，不修改用户原预设的思维链规则。
-
-严格输出：
-<stscdev_self_check>
-无需依据：<item id="题目ID"><answer>最终回答</answer></item>
-需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体剧情、角色设定或世界观依据</evidence></item>
-</stscdev_self_check>
-
-凡问题标记 evidence_required="true"，<evidence>不得省略、不得为空，也不得只把依据混写在<answer>中。
-
-本轮问题：
-${buildQuestionXml(questions)}
-`.trim();
-}
-
-function buildStrictMainPrompt(questions, checkText) {
-    return `
-[墨提斯之镜 DEV 插件｜双阶段严格模式第二阶段]
-下面是本轮已经完成的墨提斯之镜 DEV。你必须严格依据这些结论生成正文，不得与其冲突，也不得重新输出自检内容。
-
-<stscdev_completed_self_check>
-${checkText}
-</stscdev_completed_self_check>
-
-对应问题：
-${buildQuestionXml(questions)}
-
-按照用户原预设正常输出其要求的 thinking / reasoning 内容、正文、状态栏以及全部正常输出格式。
-不要重复输出 <stscdev_self_check>，也不要给正文或原生思维链添加任何由本插件定义的包裹标签。
-`.trim();
-}
-
 function buildReferencePrompt(reference) {
     const config = referenceTypeConfig(reference.type);
     return `
@@ -1310,17 +1552,19 @@ function setRuntimePrompt(key, text, config) {
     runtimePromptKeys.add(key);
 }
 
-function clearRuntimePrompts() {
+function clearRuntimePrompt(key) {
     const context = ctx();
     if (!context?.setExtensionPrompt) return;
-    for (const key of runtimePromptKeys) {
-        try {
-            context.setExtensionPrompt(key, '', -1, 0, false, 0);
-        } catch (error) {
-            console.warn('[STSC] 清理注入失败：', key, error);
-        }
+    try {
+        context.setExtensionPrompt(key, '', -1, 0, false, 0);
+    } catch (error) {
+        console.warn('[STSC] 清理注入失败：', key, error);
     }
-    runtimePromptKeys.clear();
+    runtimePromptKeys.delete(key);
+}
+
+function clearRuntimePrompts() {
+    for (const key of [...runtimePromptKeys]) clearRuntimePrompt(key);
 }
 
 function applyReferencePrompts(references) {
@@ -1332,6 +1576,340 @@ function applyReferencePrompts(references) {
 function applyTemporaryPrompt(instructions, injection) {
     if (!instructions.length) return;
     setRuntimePrompt('stscdev_one_shot', buildTemporaryPrompt(instructions), injection);
+}
+
+function compactPromptText(value) {
+    return String(value ?? '').replace(/\r\n/g, '\n').trim();
+}
+
+function getCharacterField(character, field) {
+    const direct = character?.[field];
+    const nested = character?.data?.[field];
+    return compactPromptText(direct ?? nested ?? '');
+}
+
+function formatCharacterCardForDualApi(character) {
+    if (!character) return '';
+    const fields = [
+        ['角色名称', getCharacterField(character, 'name')],
+        ['角色描述', getCharacterField(character, 'description')],
+        ['性格', getCharacterField(character, 'personality')],
+        ['场景', getCharacterField(character, 'scenario')],
+        ['角色系统提示', getCharacterField(character, 'system_prompt')],
+        ['历史后置指令', getCharacterField(character, 'post_history_instructions')],
+        ['示例对话', getCharacterField(character, 'mes_example')],
+        ['首条消息', getCharacterField(character, 'first_mes')],
+    ].filter(([, value]) => value);
+    if (!fields.length) return '';
+    return fields.map(([label, value]) => `【${label}】\n${value}`).join('\n\n');
+}
+
+function getDualApiCharacterContext() {
+    const context = ctx();
+    if (!context) return '';
+
+    if (!context.groupId) {
+        const character = context.characters?.[Number(context.characterId)];
+        return formatCharacterCardForDualApi(character);
+    }
+
+    const group = context.groups?.find?.(item => String(item.id) === String(context.groupId));
+    const memberKeys = new Set((group?.members || []).map(value => String(value)));
+    const cards = (context.characters || [])
+        .filter(character => {
+            const avatar = String(character?.avatar || character?.data?.avatar || '');
+            const name = String(character?.name || character?.data?.name || '');
+            return memberKeys.has(avatar) || memberKeys.has(name);
+        })
+        .map(formatCharacterCardForDualApi)
+        .filter(Boolean);
+    const title = group?.name ? `【当前群聊】\n${group.name}` : '【当前群聊】';
+    return [title, ...cards].join('\n\n---\n\n');
+}
+
+function dualApiChatRole(message) {
+    const explicit = String(message?.role || '').toLowerCase();
+    if (['system', 'user', 'assistant'].includes(explicit)) return explicit;
+    if (message?.is_system) return 'system';
+    return message?.is_user ? 'user' : 'assistant';
+}
+
+function dualApiChatContent(message) {
+    const content = message?.mes ?? message?.content ?? '';
+    if (Array.isArray(content)) {
+        return content.map(part => {
+            if (typeof part === 'string') return part;
+            return part?.text || part?.content || '';
+        }).join('\n').trim();
+    }
+    return compactPromptText(content);
+}
+
+function selectDualApiChat(chat, dual) {
+    const source = (Array.isArray(chat) ? clone(chat) : [])
+        .map(message => ({ role: dualApiChatRole(message), content: dualApiChatContent(message) }))
+        .filter(message => message.content);
+    if (!source.length || dual.contextMode === 'all') return source;
+
+    const turns = dual.contextMode === 'custom'
+        ? clampNumber(dual.customTurns, 1, 100, 5)
+        : 5;
+    let currentUserIndex = -1;
+    for (let index = source.length - 1; index >= 0; index--) {
+        if (source[index].role === 'user') {
+            currentUserIndex = index;
+            break;
+        }
+    }
+
+    if (currentUserIndex < 0) {
+        return source.slice(-Math.max(1, turns * 2 + 1));
+    }
+
+    const previous = source.slice(0, currentUserIndex);
+    const previousUserIndices = [];
+    previous.forEach((message, index) => {
+        if (message.role === 'user') previousUserIndices.push(index);
+    });
+    const startIndex = previousUserIndices.length > turns
+        ? previousUserIndices[previousUserIndices.length - turns]
+        : 0;
+    return previous.slice(startIndex).concat(source.slice(currentUserIndex));
+}
+
+function buildDualApiReferenceContext(references) {
+    if (!references.length) return '（本轮未启用插件参考资料库）';
+    return references.map((reference, index) => {
+        const config = referenceTypeConfig(reference.type);
+        return [
+            `<reference index="${index + 1}" id="${escapeXml(reference.id)}" type="${escapeXml(reference.type)}">`,
+            `<name>${escapeXml(reference.name || '未命名资料')}</name>`,
+            `<category>${escapeXml(config.label)}</category>`,
+            `<content>${escapeXml(reference.content.trim())}</content>`,
+            `</reference>`,
+        ].join('\n');
+    }).join('\n');
+}
+
+function buildDualApiTemporaryContext(instructions) {
+    if (!instructions.length) return '（本轮未启用快捷指令）';
+    return instructions.map((instruction, index) => `${index + 1}. 【${instruction.name}】${instruction.content.trim()}`).join('\n');
+}
+
+function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings) {
+    const characterContext = getDualApiCharacterContext() || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
+    const selectedChat = selectDualApiChat(chat, settings.dualApi);
+    const systemPrompt = `
+[墨提斯之镜 DEV｜独立自检API]
+你是写作前置自检模型。你的唯一任务是为下一步“酒馆主API”完成本轮自检，不得写角色扮演正文、对白、动作描写、状态栏或续写剧情。
+
+工作要求：
+1. 结合角色资料、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
+2. 每个答案都必须能直接交给另一个没有看到题目背景或资料原文的写作模型执行。
+3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
+4. 不得漏题、合并题目或改变题目ID。
+5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
+6. 只输出下方指定的自检XML，不要输出解释、Markdown代码围栏或正文。
+
+严格输出格式：
+<stscdev_self_check>
+无需依据：<item id="题目ID"><answer>可独立执行的最终回答</answer></item>
+需要依据：<item id="题目ID"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
+</stscdev_self_check>
+
+【当前角色资料】
+${characterContext}
+
+【本轮启用的插件参考资料库】
+${buildDualApiReferenceContext(references)}
+
+【本轮启用的快捷指令】
+${buildDualApiTemporaryContext(temporaryInstructions)}
+`.trim();
+
+    const answerStyleInstruction = settings.dualApi.transformFormat
+        ? `回答将被转换为强力执行规范。每个 <answer> 只写可直接执行的结论：不要重复问题、资料库名称或分析过程；优先使用“必须／不得／应当”等明确措辞，控制在 1—4 条完整规则内。<evidence> 只保留最关键依据，通常 1—2 句，且不要重复答案。`
+        : `每个 <answer> 必须完整、明确、自包含，不得只回答“是／否”“会遵照”或使用依赖原文才能理解的模糊指代。`;
+
+    const questionPrompt = `
+请现在完成本轮全部自检。回答必须自包含：即使下一步写作模型看不到问题、参考资料原文和你的分析过程，也能仅凭每个 <answer> 准确执行。不得输出正文。
+${answerStyleInstruction}
+
+本轮问题：
+${buildQuestionXml(questions)}
+`.trim();
+
+    return [
+        { role: 'system', content: systemPrompt },
+        ...selectedChat,
+        { role: 'user', content: questionPrompt },
+    ];
+}
+
+function extractDualApiText(payload) {
+    const choices = Array.isArray(payload?.choices) ? payload.choices : [];
+    const first = choices[0] || {};
+    const candidates = [
+        first?.message?.content,
+        first?.message?.reasoning_content,
+        first?.text,
+        payload?.content,
+        payload?.text,
+        payload?.response,
+        payload?.output_text,
+    ];
+    for (const candidate of candidates) {
+        if (Array.isArray(candidate)) {
+            const joined = candidate.map(part => {
+                if (typeof part === 'string') return part;
+                return part?.text || part?.content || part?.value || '';
+            }).join('\n').trim();
+            if (joined) return joined;
+        }
+        const text = compactPromptText(candidate);
+        if (text && text !== '[object Object]') return text;
+    }
+    return '';
+}
+
+async function callDualApiSelfCheck({ chat, questions, references, temporaryInstructions, settings }) {
+    const dual = settings.dualApi;
+    const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
+    const model = String(dual.model || '').trim();
+    if (!endpoint) throw new Error('尚未填写有效的自检API接口地址。');
+    if (!model) throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，然后保存。');
+
+    const context = ctx();
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 120000);
+    try {
+        const headers = {
+            'Content-Type': 'application/json',
+            ...(context?.getRequestHeaders?.() || {}),
+        };
+        const response = await fetch('/api/backends/chat-completions/generate', {
+            method: 'POST',
+            headers,
+            signal: controller.signal,
+            body: JSON.stringify({
+                type: 'quiet',
+                messages: buildDualApiMessages(chat, questions, references, temporaryInstructions, settings),
+                model,
+                temperature: 0.2,
+                frequency_penalty: 0,
+                presence_penalty: 0,
+                top_p: 1,
+                max_tokens: clampNumber(dual.maxTokens, 256, 12000, 2000),
+                stream: false,
+                chat_completion_source: 'openai',
+                reverse_proxy: endpoint,
+                proxy_password: String(dual.apiKey || ''),
+                include_reasoning: false,
+            }),
+        });
+
+        const responseText = await response.text();
+        let payload = {};
+        try {
+            payload = responseText ? JSON.parse(responseText) : {};
+        } catch {
+            payload = { text: responseText };
+        }
+
+        if (!response.ok || payload?.error) {
+            const message = compactPromptText(payload?.error?.message || payload?.message || payload?.error || responseText);
+            throw new Error(message || `自检API请求失败（HTTP ${response.status}）。`);
+        }
+
+        const text = extractDualApiText(payload);
+        if (!text) throw new Error('自检API返回成功，但没有读取到任何文本。');
+        return text;
+    } catch (error) {
+        if (error?.name === 'AbortError') throw new Error('自检API等待超过120秒，已超时。');
+        throw error;
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+function dualApiAnswerRows(questions, parsed) {
+    const answerMap = new Map((parsed?.answers || []).map(answer => [answer.id, answer]));
+    return questions.map((question, index) => {
+        const answer = answerMap.get(question.id) || {};
+        return {
+            index: index + 1,
+            id: question.id,
+            question: question.text,
+            source: question.source || '',
+            answer: compactPromptText(answer.answer),
+            evidence: compactPromptText(answer.evidence),
+        };
+    });
+}
+
+function buildDualApiRawInjection(questions, parsed) {
+    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    if (!rows.length) return '';
+
+    const content = rows.map(row => [
+        `Q${row.index}：${row.question}`,
+        `A${row.index}：${row.answer}`,
+        row.evidence ? `A${row.index}依据：${row.evidence}` : '',
+        row.source ? `问题来源：${row.source}` : '',
+    ].filter(Boolean).join('\n')).join('\n\n');
+
+    return `
+[墨提斯之镜｜本轮已完成独立自检]
+以下内容是我在生成正文前已经完成的本轮自检结论。接下来必须依据这些结论继续写作，不得忽略、否定或绕过；不要在最终回复中重复、解释或展示自检内容。
+
+${content}
+
+现在依据以上结论，按照当前角色卡、酒馆预设、世界观和用户最后一条消息生成最终正文。
+`.trim();
+}
+
+function buildDualApiContractInjection(questions, parsed) {
+    const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
+    if (!rows.length) return '';
+
+    const rules = rows.map(row => {
+        const sourceAttribute = row.source ? ` source="${escapeXml(row.source)}"` : '';
+        return [
+            `<rule index="${row.index}"${sourceAttribute}>`,
+            `<requirement>${escapeXml(row.answer)}</requirement>`,
+            row.evidence ? `<basis>${escapeXml(row.evidence)}</basis>` : '',
+            `</rule>`,
+        ].filter(Boolean).join('\n');
+    }).join('\n');
+
+    return `
+<stscdev_execution_contract>
+以下内容是本轮正文必须执行的规则；不得冲突、弱化、绕过，也不得在最终回复中复述或暴露。
+${rules}
+</stscdev_execution_contract>
+`.trim();
+}
+
+function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
+    const transform = Boolean(settings.dualApi.transformFormat);
+    const text = transform
+        ? buildDualApiContractInjection(questions, parsed)
+        : buildDualApiRawInjection(questions, parsed);
+
+    if (!text) {
+        clearRuntimePrompt('stscdev_dual_main');
+        return;
+    }
+
+    setRuntimePrompt('stscdev_dual_main', text, {
+        position: 'chat',
+        depth: 0,
+        role: transform ? 'system' : 'assistant',
+    });
+}
+
+function dualApiFailureMessage(error) {
+    return compactPromptText(error?.message || error || '未知错误');
 }
 
 async function saveLatestResult(result) {
@@ -1499,12 +2077,12 @@ function refreshMessageDom(messageId, message) {
     }
 }
 
-function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', strictStatus = '' }) {
+function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = '', statusOverride = '' }) {
     const entity = getCurrentEntity();
     const boundPreset = getBoundPreset();
     const settings = normalizeSettings();
 
-    const status = strictStatus || parsed.status;
+    const status = statusOverride || parsed.status;
     return {
         version: STSC_VERSION,
         timestamp: Date.now(),
@@ -1516,7 +2094,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', 
         status,
         issueViewed: !['missing', 'format_error'].includes(status),
         formatIssues: parsed.formatIssues || [],
-        rawCheck: strictRaw || parsed.rawCheck || '',
+        rawCheck: rawOverride || parsed.rawCheck || '',
         answers: parsed.answers || [],
         expectedCount: questions.length,
         answeredCount: (parsed.answers || []).filter(x => x.answer?.trim()).length,
@@ -1531,6 +2109,7 @@ function statusText(status) {
         format_error: '本轮自检格式有误',
         missing: '本轮AI未输出自检问答',
         strict_ok: '双阶段自检已完成',
+        dual_ok: '双API自检已完成',
     }[status] || '暂无状态';
 }
 
@@ -1538,13 +2117,14 @@ function statusIcon(status) {
     return {
         ok: '✓',
         strict_ok: '✓',
+        dual_ok: '✓',
         format_error: '⚠',
         missing: '!',
     }[status] || '○';
 }
 
 function statusClass(status) {
-    if (status === 'ok' || status === 'strict_ok') return 'stscdev-status-ok';
+    if (status === 'ok' || status === 'strict_ok' || status === 'dual_ok') return 'stscdev-status-ok';
     if (status === 'format_error') return 'stscdev-status-warning';
     if (status === 'missing') return 'stscdev-status-error';
     return '';
@@ -1557,7 +2137,6 @@ async function handleMessageReceived(data) {
     if (!settings?.enabled) {
         // 插件关闭时不读取、不解析、不改写任何AI回复，也不生成缺失/格式错误提示。
         pendingRun = null;
-        strictBusy = false;
         clearRuntimePrompts();
         return;
     }
@@ -1576,24 +2155,24 @@ async function handleMessageReceived(data) {
     let parsed;
     let latest;
 
-    if (mode === 'strict' && run?.strictCheck) {
+    if (mode === 'dual_api' && run?.dualCheck) {
         const mainParsed = parseModelOutput(rawText, []);
         const body = mainParsed.status === 'missing' ? String(rawText ?? '').trim() : mainParsed.body;
         updateMessageText(message, body);
 
-        const checkParsed = run.strictParsed || parseModelOutput(run.strictCheck, questions);
-        const strictStatus = checkParsed.status === 'ok' ? 'strict_ok' : 'format_error';
+        const checkParsed = run.dualParsed || parseModelOutput(run.dualCheck, questions);
+        const dualStatus = checkParsed.status === 'ok' ? 'dual_ok' : 'format_error';
         latest = makeLatestResult({
             parsed: checkParsed,
             questions,
             mode,
             messageId,
-            strictRaw: checkParsed.rawCheck || run.strictCheck,
-            strictStatus,
+            rawOverride: checkParsed.rawCheck || run.dualCheck,
+            statusOverride: dualStatus,
         });
         if (mainParsed.status !== 'missing') {
-            latest.formatIssues.push('第二阶段意外重复输出了自检内容，插件已自动移除。');
-            if (latest.status === 'strict_ok') latest.status = 'format_error';
+            latest.formatIssues.push('酒馆主API意外重复输出了自检内容，插件已自动移除。');
+            if (latest.status === 'dual_ok') latest.status = 'format_error';
         }
     } else {
         parsed = parseModelOutput(rawText, questions);
@@ -1633,7 +2212,7 @@ function onGenerationEnded() {
 function onGenerationStopped() {
     clearRuntimePrompts();
     pendingRun = null;
-    strictBusy = false;
+    dualApiBusy = false;
 }
 
 function isOfficialPluginEnabled() {
@@ -1684,44 +2263,58 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
         questions: clone(questions),
         startedAt: Date.now(),
         generationType: type,
-        strictCheck: '',
-        strictParsed: null,
+        dualCheck: '',
+        dualParsed: null,
         targetMessageFloor,
     };
 
-    if (settings.mode === 'strict') {
-        if (strictBusy) return;
-        strictBusy = true;
-        try {
-            const prompt = buildStrictCheckPrompt(questions);
-            internalQuietActive = true;
-            const raw = await context.generateQuietPrompt({ quietPrompt: prompt });
-            internalQuietActive = false;
-            const strictCheck = String(raw || '').trim();
-            if (!strictCheck) {
-                abort?.(true);
-                pendingRun = null;
-                toastr.error('第一阶段没有得到自检结果，已取消正文生成。', '墨提斯之镜 DEV');
-                return;
-            }
-            const strictParsed = parseModelOutput(strictCheck, questions);
-            pendingRun.strictCheck = strictCheck;
-            pendingRun.strictParsed = strictParsed;
-
-            // The internal quiet generation emits its own generation-ended event,
-            // so restore all prompts needed by the real second-stage generation.
-            clearRuntimePrompts();
-            applyReferencePrompts(references);
-            applyTemporaryPrompt(temporaryInstructions, settings.injection);
-            setRuntimePrompt('stscdev_main', buildStrictMainPrompt(questions, strictParsed.rawCheck || strictCheck), settings.injection);
-        } catch (error) {
-            internalQuietActive = false;
-            console.error('[STSC] 双阶段第一阶段失败：', error);
+    if (settings.mode === 'dual_api') {
+        if (dualApiBusy) {
             abort?.(true);
             pendingRun = null;
-            toastr.error('双阶段自检调用失败，已取消正文生成。', '墨提斯之镜 DEV');
+            toastr.warning('上一轮独立自检仍在处理中，请稍后再试。', '墨提斯之镜 DEV');
+            return;
+        }
+        dualApiBusy = true;
+        try {
+            const dualQuestions = getDualApiQuestions(settings);
+            pendingRun.questions = clone(dualQuestions);
+            const rawCheck = await callDualApiSelfCheck({
+                chat: _chat,
+                questions: dualQuestions,
+                references,
+                temporaryInstructions,
+                settings,
+            });
+            const dualParsed = parseModelOutput(rawCheck, dualQuestions);
+            if (dualParsed.status === 'missing') {
+                dualParsed.status = 'format_error';
+                dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stscdev_self_check> 结构。');
+            }
+            pendingRun.dualCheck = rawCheck;
+            pendingRun.dualParsed = dualParsed;
+            pendingRun.mode = 'dual_api';
+            applyDualApiMainPrompt(dualQuestions, dualParsed, rawCheck, settings);
+            if (dualParsed.status !== 'ok') {
+                toastr.warning('独立自检API已经返回结果，但格式不完整。本轮仍会把结果交给酒馆主API，并在自检记录中标记格式问题。', '墨提斯之镜 DEV', { timeOut: 7000 });
+            }
+        } catch (error) {
+            console.error('[STSC DEV] 双API自检调用失败：', error);
+            const reason = dualApiFailureMessage(error);
+            if (settings.dualApi.failureMode === 'fallback_single') {
+                pendingRun.mode = 'single';
+                pendingRun.questions = clone(questions);
+                setRuntimePrompt('stscdev_main', buildSinglePrompt(questions), settings.injection);
+                toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜 DEV', { timeOut: 9000 });
+            } else {
+                abort?.(true);
+                pendingRun = null;
+                clearRuntimePrompts();
+                toastr.error(`独立自检API调用失败，本轮生成已停止。原因：${reason}`, '墨提斯之镜 DEV', { timeOut: 9000 });
+                return;
+            }
         } finally {
-            strictBusy = false;
+            dualApiBusy = false;
         }
     } else {
         setRuntimePrompt('stscdev_main', buildSinglePrompt(questions), settings.injection);
@@ -1748,6 +2341,16 @@ function activeSummary(settings = getUiSettings()) {
         temps,
         presetText: parts.join(' ＋ '),
     };
+}
+
+function generationModeLabel(mode, detailed = false) {
+    const labels = {
+        single: detailed ? '单API调用（一次调用）' : '单API调用',
+        dual_api: detailed ? '双API调用（插件API自检＋酒馆主API正文）' : '双API调用',
+        // 仅用于兼容旧聊天中已经保存的历史模式名称，不再作为可选或可执行模式。
+        strict: detailed ? '旧双阶段模式（已移除）' : '旧双阶段模式',
+    };
+    return labels[mode] || labels.single;
 }
 
 function renderCompact() {
@@ -1818,7 +2421,7 @@ function renderStatusTab() {
         latestHtml = `
             <div class="stscdev-meta-row">
                 <span class="stscdev-status-pill ${statusClass(latest.status)}">${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</span>
-                <span class="stscdev-status-pill">${latest.mode === 'strict' ? '双阶段严格模式' : '单次模式'}</span>
+                <span class="stscdev-status-pill">${escapeHtml(generationModeLabel(latest.mode))}</span>
                 <span class="stscdev-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
                 <span class="stscdev-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>
             </div>
@@ -1837,7 +2440,7 @@ function renderStatusTab() {
             <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
             <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
             <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
-            <div><b>模式：</b>${settings.mode === 'strict' ? '双阶段严格模式（两次调用）' : '单次模式（一次调用）'}</div>
+            <div><b>模式：</b>${escapeHtml(generationModeLabel(settings.mode, true))}</div>
             <div class="stscdev-section-title" style="margin-top:12px">当前启用的快捷指令</div>
             ${tempPills}
         </div>
@@ -2177,21 +2780,141 @@ function renderTemporaryTab() {
 
 function renderSettingsTab() {
     const settings = getUiSettings();
+    const dual = settings.dualApi || DEFAULT_SETTINGS.dualApi;
+    const dualVisible = settings.mode === 'dual_api';
+    const customTurnsVisible = dual.contextMode === 'custom';
+    const modelOptions = dualApiModelOptionsHtml(dual);
     $('#stscdev_tab_settings').html(`
         <div class="stscdev-section">
             <div class="stscdev-section-title">运行方式</div>
             <label class="checkbox_label"><input id="stscdev_setting_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}> 启用插件</label>
             <div class="stscdev-grid-2" style="margin-top:10px">
                 <div class="stscdev-field"><label>生成模式</label><select id="stscdev_setting_mode" class="text_pole">
-                    <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单次模式：自检与正文一次生成</option>
-                    <option value="strict" ${settings.mode === 'strict' ? 'selected' : ''}>双阶段严格模式：先自检，再调用一次生成正文</option>
-                </select></div>
+                    <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单API调用：自检与正文一次生成（现有模式）</option>
+                    <option value="dual_api" ${settings.mode === 'dual_api' ? 'selected' : ''}>双API调用：插件API自检，酒馆主API写正文（DEV）</option>
+                </select>
+                <div class="stscdev-mode-help">
+                    ${settings.mode === 'single' ? '当前模式不变：由酒馆主API在同一次回复中完成自检和正文。' : ''}
+                    ${settings.mode === 'dual_api' ? '插件API只负责回答自检；结果会在下一阶段交给酒馆主API生成正文。' : ''}
+                </div></div>
                 <div class="stscdev-field"><label>预设叠加</label>
                     <label class="checkbox_label"><input id="stscdev_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 启用通用预设</label>
                     <label class="checkbox_label"><input id="stscdev_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 启用角色专属预设</label>
                 </div>
             </div>
+            <div class="stscdev-dual-branch-card" style="margin-top:12px">
+                <div class="stscdev-dual-branch-grid">
+                    <div class="stscdev-dual-branch ${settings.mode === 'single' ? 'is-active' : ''}">
+                        <b>单API调用（默认）</b>
+                        <span><b>优点：</b>速度快、省额度，同一模型连续完成自检和正文，角色与文风通常更自然。</span>
+                        <span><b>不足：</b>问题较多时可能漏答或分心，复杂格式与硬性限制的执行稳定性稍弱。</span>
+                    </div>
+                    <div class="stscdev-dual-branch ${settings.mode === 'dual_api' ? 'is-active' : ''}">
+                        <b>双API调用</b>
+                        <span><b>优点：</b>自检与正文分工，复杂规则、关系阶段和固定格式通常更稳定，也更方便查看与排查。</span>
+                        <span><b>不足：</b>会增加一次调用与等待；自检模型判断错误时，也可能把错误规则传给正文模型。</span>
+                    </div>
+                </div>
+                <div class="stscdev-muted" style="margin-top:8px">日常聊天或更重视自然演绎时可用单API；规则较多、经常漏格式或关系跳级时可用双API。</div>
+            </div>
         </div>
+
+        <div id="stscdev_dual_api_section" class="stscdev-section stscdev-dual-api-section ${dualVisible ? '' : 'stscdev-hidden'}">
+            <div class="stscdev-section-title stscdev-section-title-row">
+                <span>双API调用设置</span>
+                <span class="stscdev-dev-pill">DEV 核心测试</span>
+            </div>
+            <div class="stscdev-dev-notice">
+                双API核心流程已启用：每次生成会先消耗一次自检API调用，再把自检结果临时交给酒馆主API生成正文。当前仍是 DEV 测试版本，请先在测试酒馆中使用。
+            </div>
+
+            <div class="stscdev-grid-2" style="margin-top:12px">
+                <div class="stscdev-field">
+                    <label>自检API接口地址</label>
+                    <input id="stscdev_dual_endpoint" class="text_pole" type="text" autocomplete="off" placeholder="例如：https://example.com/v1" value="${escapeHtml(dual.endpoint)}">
+                    <div class="stscdev-muted">填写 OpenAI 兼容接口的基础地址，通常以 <code>/v1</code> 结尾；不要填写 <code>/chat/completions</code>。</div>
+                </div>
+                <div class="stscdev-field">
+                    <label>自检模型</label>
+                    <div class="stscdev-model-row">
+                        <select id="stscdev_dual_model" class="text_pole" ${dualApiModels.length && !dualApiModelsLoading ? '' : 'disabled'}>
+                            ${modelOptions}
+                        </select>
+                        <button id="stscdev_refresh_models" class="menu_button stscdev-small-button" type="button" ${normalizeDualApiBaseUrl(dual.endpoint) && !dualApiModelsLoading ? '' : 'disabled'}>${dualApiModelsLoading ? '获取中…' : '刷新模型'}</button>
+                    </div>
+                    <div id="stscdev_dual_model_status" class="stscdev-muted stscdev-model-status ${dualApiModelsError ? 'stscdev-model-status-error' : ''} ${dualApiModels.length && !dualApiModelsError ? 'stscdev-model-status-success' : ''}">${escapeHtml(dualApiModelStatusText(dual))}</div>
+                    <div class="stscdev-muted">模型列表会根据接口自动拉取，不需要手动输入模型名称。</div>
+                </div>
+            </div>
+
+            <div class="stscdev-field" style="margin-top:10px">
+                <label>API密钥</label>
+                <div class="stscdev-secret-row">
+                    <input id="stscdev_dual_api_key" class="text_pole" type="password" autocomplete="new-password" placeholder="sk-…" value="${escapeHtml(dual.apiKey)}">
+                    <button id="stscdev_toggle_api_key" class="menu_button stscdev-small-button" type="button">显示</button>
+                </div>
+                <div class="stscdev-muted">密钥保存在这份 DEV 酒馆的插件设置中，不会写入导出的预设或资料库文件。</div>
+            </div>
+
+            <div class="stscdev-grid-3" style="margin-top:10px">
+                <div class="stscdev-field">
+                    <label>自检最大回复长度</label>
+                    <input id="stscdev_dual_max_tokens" class="text_pole" type="number" min="256" max="12000" step="128" value="${Math.round(dual.maxTokens)}">
+                    <div class="stscdev-muted">单位：Token</div>
+                </div>
+                <div class="stscdev-field">
+                    <label>自检API读取聊天范围</label>
+                    <select id="stscdev_dual_context_mode" class="text_pole">
+                        <option value="recent5" ${dual.contextMode === 'recent5' ? 'selected' : ''}>最近5轮（默认）</option>
+                        <option value="custom" ${dual.contextMode === 'custom' ? 'selected' : ''}>自定义轮数</option>
+                        <option value="all" ${dual.contextMode === 'all' ? 'selected' : ''}>全部聊天</option>
+                    </select>
+                    <div class="stscdev-muted">“一轮”指一组用户消息与AI回复；当前用户刚发送的消息会额外加入。</div>
+                </div>
+                <div id="stscdev_dual_custom_turns_wrap" class="stscdev-field ${customTurnsVisible ? '' : 'stscdev-field-disabled'}">
+                    <label>自定义轮数</label>
+                    <input id="stscdev_dual_custom_turns" class="text_pole" type="number" min="1" max="100" value="${Math.round(dual.customTurns)}" ${customTurnsVisible ? '' : 'disabled'}>
+                </div>
+            </div>
+
+            <div class="stscdev-dual-regex-note" style="margin-top:10px">
+                <b>聊天正文读取说明</b>
+                <span>自检API读取的是经过酒馆当前全局正则与角色局部出站正则处理后的聊天内容，与酒馆主API看到的正文保持一致。</span>
+            </div>
+
+            <div class="stscdev-dual-branch-card" style="margin-top:12px">
+                <label class="checkbox_label stscdev-strong-checkbox">
+                    <input id="stscdev_dual_transform_format" type="checkbox" ${dual.transformFormat ? 'checked' : ''}>
+                    将自检格式转化为强力规范
+                </label>
+                <div class="stscdev-dual-branch-grid">
+                    <div class="stscdev-dual-branch ${!dual.transformFormat ? 'is-active' : ''}">
+                        <b>不勾选</b>
+                        <span>把问题、答案与依据原样作为 <code>Assistant role</code> 临时交给酒馆主API。</span>
+                    </div>
+                    <div class="stscdev-dual-branch ${dual.transformFormat ? 'is-active' : ''}">
+                        <b>勾选后</b>
+                        <span>插件把自检答案包装成更明确的执行规范，再作为 <code>System role</code> 临时交给酒馆主API。</span>
+                    </div>
+                </div>
+                <div class="stscdev-muted" style="margin-top:8px">无论选择哪一种，自检与规范都只用于本轮，不写入正式聊天记录。</div>
+            </div>
+
+            <div class="stscdev-grid-2" style="margin-top:12px">
+                <div class="stscdev-field">
+                    <label>自检API失败时</label>
+                    <select id="stscdev_dual_failure_mode" class="text_pole">
+                        <option value="fallback_single" ${dual.failureMode === 'fallback_single' ? 'selected' : ''}>自动退回单API调用，继续生成正文</option>
+                        <option value="stop" ${dual.failureMode === 'stop' ? 'selected' : ''}>停止本轮生成并提示错误</option>
+                    </select>
+                </div>
+                <div class="stscdev-dual-library-note">
+                    <b>资料库在双API模式下</b>
+                    <span>资料库自动问题会改成“自包含规则型问题”，要求自检API说清楚正文具体该怎么写、怎么遵照；酒馆主API即使没有直接读取资料原文，也能看懂答案。</span>
+                </div>
+            </div>
+        </div>
+
         <div class="stscdev-section">
             <div class="stscdev-section-title">自检与快捷指令默认注入位置</div>
             <div class="stscdev-muted">默认使用“系统最前”，优先级最高；只有熟悉提示词结构时才建议调整。</div>
@@ -2247,6 +2970,16 @@ function renderSettingsTab() {
 结束标签之后 → 正常流式正文</div>
         </div>
     `);
+
+    if (dualVisible) {
+        const signature = dualApiConnectionSignature(dual);
+        setTimeout(() => {
+            updateDualApiModelControl();
+            if (normalizeDualApiBaseUrl(dual.endpoint) && signature !== dualApiModelsSignature) {
+                scheduleDualApiModelFetch(120);
+            }
+        }, 0);
+    }
 }
 
 
@@ -3250,9 +3983,72 @@ function bindUiEvents() {
         renderAll();
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_setting_mode', function () {
-        getUiSettings().mode = this.value;
+        getUiSettings().mode = ['single', 'dual_api'].includes(this.value) ? this.value : 'single';
         markDirty();
         renderAll();
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_dual_endpoint', function (event) {
+        const dual = getUiSettings().dualApi;
+        dual.endpoint = this.value;
+        if (event.type === 'change') {
+            const normalized = normalizeDualApiBaseUrl(this.value);
+            if (normalized) {
+                dual.endpoint = normalized;
+                this.value = normalized;
+            }
+        }
+        markDirty();
+        resetDualApiModelState();
+        if (normalizeDualApiBaseUrl(dual.endpoint)) scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_model', function () {
+        if (!dualApiModels.includes(this.value)) return;
+        getUiSettings().dualApi.model = this.value;
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_dual_api_key', function (event) {
+        getUiSettings().dualApi.apiKey = this.value;
+        markDirty();
+        resetDualApiModelState();
+        if (normalizeDualApiBaseUrl(getUiSettings().dualApi.endpoint)) {
+            scheduleDualApiModelFetch(event.type === 'change' ? 0 : 800);
+        }
+    });
+    $('#stscdev_manager_overlay').on('click', '#stscdev_refresh_models', function () {
+        scheduleDualApiModelFetch(0, { force: true, showToast: true });
+    });
+    $('#stscdev_manager_overlay').on('click', '#stscdev_toggle_api_key', function () {
+        const input = document.getElementById('stscdev_dual_api_key');
+        if (!input) return;
+        const showing = input.type === 'text';
+        input.type = showing ? 'password' : 'text';
+        $(this).text(showing ? '显示' : '隐藏');
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_max_tokens', function () {
+        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 2000);
+        this.value = Math.round(getUiSettings().dualApi.maxTokens);
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_context_mode', function () {
+        getUiSettings().dualApi.contextMode = ['recent5', 'custom', 'all'].includes(this.value) ? this.value : 'recent5';
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_custom_turns', function () {
+        getUiSettings().dualApi.customTurns = clampNumber(this.value, 1, 100, 5);
+        this.value = Math.round(getUiSettings().dualApi.customTurns);
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_transform_format', function () {
+        getUiSettings().dualApi.transformFormat = this.checked;
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_failure_mode', function () {
+        getUiSettings().dualApi.failureMode = ['fallback_single', 'stop'].includes(this.value) ? this.value : 'fallback_single';
+        markDirty();
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_general_enabled', function () {
         getUiSettings().generalEnabled = this.checked;
