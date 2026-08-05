@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.9';
+const STSC_VERSION = '0.4.0-beta.11';
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
 const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
@@ -25,12 +25,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-05',
-    title: '移除双阶段严格模式',
+    title: '修复强力规范中的格式标签重复转义',
     changes: Object.freeze([
-        '正式移除容易与双API调用混淆的“双阶段严格模式”及其两次调用逻辑。',
-        '生成模式现在只保留“单API调用”和“双API调用”两种。',
-        '旧设置若曾选择双阶段严格模式，会自动安全迁移为单API调用，不影响其他设置、预设、资料库与历史自检记录。',
-        '双API调用、强力规范转化、资料库自包含问答与遗漏项跳过逻辑均保持不变。',
+        '修复独立自检API已将 <status_top>、<status_bottom> 等标签转成 &lt;...&gt; 后，强力规范再次转义为 &amp;lt;...&amp;gt; 的问题。',
+        '自检答案与依据现在会先还原已有的 XML/HTML 实体，再在执行协议中统一只转义一次。',
+        '主API最终会收到清晰的 &lt;status_top&gt; 一层实体，不再出现双重转义；原始聊天记录与用户资料不会被修改。',
+        '双API调用、强力规范结构、遗漏项跳过、模型获取与正式版冲突检测均保持不变。',
     ]),
 });
 
@@ -192,8 +192,35 @@ function escapeHtml(value) {
         .replaceAll("'", '&#039;');
 }
 
+function decodeXmlEntities(value) {
+    let text = String(value ?? '');
+    // 独立自检API有时会提前把 <status_top> 等标签转成 &lt;...&gt;，
+    // 若这里再次直接转义，就会得到 &amp;lt;...&amp;gt;。最多解码三轮，
+    // 先还原已有实体，再由 escapeXml 统一只转义一次。
+    for (let pass = 0; pass < 3; pass++) {
+        const decoded = text
+            .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(Number.parseInt(hex, 16)))
+            .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number.parseInt(dec, 10)))
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&quot;/gi, '"')
+            .replace(/&apos;|&#039;/gi, "'")
+            .replace(/&amp;/gi, '&');
+        if (decoded === text) break;
+        text = decoded;
+    }
+    return text;
+}
+
 function escapeXml(value) {
     return escapeHtml(value);
+}
+
+function wrapXmlCdata(value) {
+    const text = decodeXmlEntities(value);
+    // CDATA 内可直接保留 <status_top> 等原始尖括号标签。
+    // 若内容本身包含 CDATA 结束标记，则拆分为相邻的 CDATA 段，避免破坏外层协议结构。
+    return `<![CDATA[${text.replaceAll(']]>', ']]]]><![CDATA[>')}]]>`;
 }
 
 function normalizeSettings() {
@@ -1876,8 +1903,8 @@ function buildDualApiContractInjection(questions, parsed) {
         const sourceAttribute = row.source ? ` source="${escapeXml(row.source)}"` : '';
         return [
             `<rule index="${row.index}"${sourceAttribute}>`,
-            `<requirement>${escapeXml(row.answer)}</requirement>`,
-            row.evidence ? `<basis>${escapeXml(row.evidence)}</basis>` : '',
+            `<requirement>${wrapXmlCdata(row.answer)}</requirement>`,
+            row.evidence ? `<basis>${wrapXmlCdata(row.evidence)}</basis>` : '',
             `</rule>`,
         ].filter(Boolean).join('\n');
     }).join('\n');
@@ -1948,8 +1975,8 @@ function parseItems(checkInner) {
         const itemBody = match[2];
         const answerMatch = itemBody.match(/<answer[^>]*>([\s\S]*?)<\/answer>/i);
         const evidenceMatch = itemBody.match(/<evidence[^>]*>([\s\S]*?)<\/evidence>/i);
-        const answer = (answerMatch?.[1] ?? '').trim();
-        const evidence = (evidenceMatch?.[1] ?? '').trim();
+        const answer = decodeXmlEntities(answerMatch?.[1] ?? '').trim();
+        const evidence = decodeXmlEntities(evidenceMatch?.[1] ?? '').trim();
         items.push({ id, answer, evidence });
     }
     return items;
