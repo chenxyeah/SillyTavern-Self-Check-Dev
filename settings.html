@@ -1,0 +1,70 @@
+<div id="stscdev_manager_overlay" class="stscdev-overlay stscdev-hidden" aria-hidden="true">
+  <div class="stscdev-manager" role="dialog" aria-modal="true" aria-label="写作前置自检管理器">
+    <div class="stscdev-manager-header">
+      <div class="stscdev-manager-heading">
+        <div class="stscdev-manager-title">写作前置自检 <span class="stscdev-manager-version">v0.3.0</span></div>
+        <div id="stscdev_manager_subtitle" class="stscdev-manager-subtitle"></div>
+      </div>
+      <div class="stscdev-header-actions">
+        <span id="stscdev_save_state" class="stscdev-save-state">已保存</span>
+        <button id="stscdev_save_changes" class="menu_button stscdev-save-button" type="button" disabled>保存更改</button>
+        <button id="stscdev_close_manager" class="menu_button stscdev-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
+      </div>
+    </div>
+
+    <div class="stscdev-tabs" role="tablist" aria-label="写作前置自检功能页">
+      <button class="stscdev-tab active" type="button" data-tab="status">当前状态</button>
+      <button class="stscdev-tab" type="button" data-tab="presets">自检预设</button>
+      <button class="stscdev-tab" type="button" data-tab="references">参考资料库</button>
+      <button class="stscdev-tab" type="button" data-tab="temporary">快捷指令</button>
+      <button class="stscdev-tab" type="button" data-tab="settings">插件设置</button>
+      <button class="stscdev-tab" type="button" data-tab="updates">版本更新</button>
+    </div>
+
+    <div class="stscdev-manager-body">
+      <section id="stscdev_tab_status" class="stscdev-tab-panel active"></section>
+      <section id="stscdev_tab_presets" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_references" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_temporary" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_settings" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_updates" class="stscdev-tab-panel"></section>
+    </div>
+  </div>
+</div>
+
+<div id="stscdev_dialog_overlay" class="stscdev-dialog-overlay stscdev-hidden" aria-hidden="true">
+  <div class="stscdev-dialog" role="dialog" aria-modal="true" aria-label="写作前置自检操作窗口">
+    <div class="stscdev-dialog-header">
+      <div id="stscdev_dialog_title" class="stscdev-dialog-title"></div>
+      <button id="stscdev_dialog_close" class="menu_button stscdev-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
+    </div>
+    <div id="stscdev_dialog_body" class="stscdev-dialog-body"></div>
+    <div id="stscdev_dialog_footer" class="stscdev-dialog-footer"></div>
+  </div>
+</div>
+
+<div id="stscdev_floating_root" class="stscdev-floating-root stscdev-hidden" aria-hidden="true">
+  <button id="stscdev_floating_button" class="stscdev-floating-button" type="button" title="打开自检与快捷指令" aria-label="打开自检与快捷指令">
+    <span class="stscdev-floating-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><circle cx="24" cy="24" r="21.5" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M38.972 28.012a15.5 15.5 0 0 1-16.995 11.356A15.5 15.5 0 0 1 8.5 24.001A15.5 15.5 0 0 1 21.977 8.634A15.5 15.5 0 0 1 38.972 19.99"/><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" d="M16.5 23.5c0-3.866 3.358-7 7.5-7s7.5 3.134 7.5 7c0 4.519-5.858 8-10 8c.481-.834.5-1.714.5-1.714c-3.198-.687-5.5-3.049-5.5-6.286"/></svg></span>
+    <span id="stscdev_floating_badge" class="stscdev-floating-badge stscdev-hidden">!</span>
+  </button>
+</div>
+
+<!-- 悬浮面板独立挂在 body 下，不再放在 50px 的可拖动按钮容器中，避免移动端被父容器压缩成细线。 -->
+<div id="stscdev_floating_panel" class="stscdev-floating-panel stscdev-hidden" role="dialog" aria-label="最新一轮自检" tabindex="-1" aria-hidden="true">
+  <div class="stscdev-floating-header">
+    <div>
+      <div id="stscdev_floating_title" class="stscdev-floating-title">最新一轮自检</div>
+      <div id="stscdev_floating_subtitle" class="stscdev-muted"></div>
+    </div>
+    <button id="stscdev_floating_close" class="menu_button stscdev-icon-button" type="button" aria-label="关闭悬浮窗">✕</button>
+  </div>
+  <div class="stscdev-floating-tabs" role="tablist" aria-label="悬浮窗功能">
+    <button class="stscdev-floating-tab active" type="button" data-floating-page="check" role="tab">自检问答</button>
+    <button class="stscdev-floating-tab" type="button" data-floating-page="instructions" role="tab">快捷指令</button>
+  </div>
+  <div id="stscdev_floating_content" class="stscdev-floating-content"></div>
+  <div class="stscdev-floating-footer">
+    <button id="stscdev_floating_open_manager" class="menu_button" type="button">打开完整管理器</button>
+  </div>
+</div>

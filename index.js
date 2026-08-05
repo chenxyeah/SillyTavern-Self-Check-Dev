@@ -1,0 +1,4056 @@
+const STSC_MODULE = 'sillytavern_self_check_dev';
+const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
+const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
+const STSC_VERSION = '0.4.0-beta.1';
+const STSC_CHECK_TAG = 'stscdev_self_check';
+const STSC_RESPONSE_TAG = 'stscdev_response';
+const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
+const STSC_CHECK_CLOSE_RE = /<\/stscdev_self_check>/i;
+const STSC_RESPONSE_OPEN_RE = /<stscdev_response\b[^>]*>/i;
+const STSC_RESPONSE_CLOSE_RE = /<\/stscdev_response>/i;
+const STSC_PRESET_EXPORT_FORMAT = 'sillytavern-self-check-preset';
+const STSC_PRESET_EXPORT_VERSION = 1;
+const STSC_PRESET_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+const STSC_REFERENCE_EXPORT_FORMAT = 'sillytavern-self-check-reference';
+const STSC_REFERENCE_EXPORT_VERSION = 1;
+const STSC_REFERENCE_BUNDLE_EXPORT_FORMAT = 'sillytavern-self-check-reference-bundle';
+const STSC_REFERENCE_BUNDLE_EXPORT_VERSION = 1;
+const STSC_REFERENCE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
+const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
+const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
+const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
+const STSC_REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/manifest.json';
+const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/version.json';
+const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
+const STSC_RELEASE_INFO = Object.freeze({
+    version: STSC_VERSION,
+    releasedAt: '2026-08-05',
+    title: '建立独立 DEV 测试环境',
+    changes: Object.freeze([
+        '基于正式版 v0.3.4 建立独立开发测试版。',
+        '测试版使用独立仓库、设置存储、界面命名空间、聊天元数据与更新地址。',
+        '正式版启用时，DEV 生成拦截器会自动保持静默，避免两套插件同时处理同一轮生成。',
+        '本版本暂未加入双 API 功能，只作为后续开发与测试基础。',
+    ]),
+});
+
+const REFERENCE_TYPE_CONFIG = Object.freeze({
+    style: Object.freeze({
+        label: '文风',
+        position: 'prompt',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】文风进行本轮写作？本轮将通过哪些具体语言、节奏与描写方式体现？',
+        promptTitle: '文风',
+        promptLead: '以下内容是本轮写作必须遵循的文风规范。请将其落实到措辞、句式、节奏、叙事视角与描写方式中，不要在正文中解释这些规则：',
+    }),
+    restriction: Object.freeze({
+        label: '限制',
+        position: 'chat',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】限制？本轮将如何具体执行，并避免出现违反限制的内容？',
+        promptTitle: '强制限制',
+        promptLead: '以下内容是本轮必须遵守的强制限制。其要求应优先落实到最终正文中，不得忽略、弱化、绕开或仅口头承诺：',
+    }),
+    other: Object.freeze({
+        label: '其他',
+        position: 'before',
+        depth: 0,
+        role: 'system',
+        autoQuestion: '是否遵照【{{name}}】资料？本轮将如何具体体现其中要求？',
+        promptTitle: '其他资料',
+        promptLead: '以下内容是本轮需要参考并落实的外置资料。请结合当前剧情与角色设定执行，不要在正文中复述资料本身：',
+    }),
+});
+
+const POSITION_MAP = Object.freeze({
+    prompt: 0,
+    chat: 1,
+    before: 2,
+});
+
+const ROLE_MAP = Object.freeze({
+    system: 0,
+    user: 1,
+    assistant: 2,
+});
+
+const DEFAULT_SETTINGS = Object.freeze({
+    enabled: true,
+    mode: 'single',
+    generalEnabled: true,
+    characterEnabled: true,
+    generalPresetId: '',
+    characterBindings: {},
+    injection: {
+        position: 'before',
+        depth: 0,
+        role: 'system',
+    },
+    presets: [],
+    references: [],
+    temporaryInstructions: [],
+    pendingInstructionIds: [],
+    persistentInstructionIds: [],
+    appearance: {
+        theme: 'default',
+        floatingEnabled: false,
+        floatingStyle: 'theme',
+        floatingOpacity: 0.94,
+        floatingButtonSize: 50,
+        floatingWidth: 420,
+        floatingHeight: 640,
+        floatingPosition: {
+            leftRatio: 0.82,
+            topRatio: 0.68,
+        },
+    },
+    migrations: {
+        defaultGeneralCoreV1: false,
+        defaultGeneralCoreV2: false,
+        defaultGeneralCoreV3: false,
+        defaultGeneralCoreV4: false,
+    },
+    updateNotice: {
+        lastCheckedAt: 0,
+        lastNotifiedAt: 0,
+        lastSeenInstalledVersion: '',
+        lastNotifiedVersion: '',
+    },
+    ui: {
+        editingPresetId: '',
+        editingGeneralPresetId: '',
+        editingCharacterPresetId: '',
+        presetSection: 'general',
+        activeTab: 'status',
+    },
+});
+
+let pendingRun = null;
+let strictBusy = false;
+let testBusy = false;
+let lastTestResult = '';
+let internalQuietActive = false;
+let runtimePromptKeys = new Set();
+let initialized = false;
+let bulkDraft = null;
+let editDraft = null;
+let editDirty = false;
+let pendingUnsavedAction = null;
+let floatingDragState = null;
+let suppressFloatingClickUntil = 0;
+let expandedReferenceIds = new Set();
+let expandedQuestionIds = new Set();
+let expandedInstructionIds = new Set();
+let floatingPanelPage = 'check';
+let pendingDeleteRequest = null;
+let updateCheckInFlight = false;
+let updatePollTimer = null;
+let updateToast = null;
+let updateAvailableVersion = '';
+let latestRemoteReleaseInfo = null;
+let updateCheckState = 'idle';
+let updateCheckError = '';
+let lastRuntimeUpdateCheckAt = 0;
+let officialConflictWarned = false;
+
+function ctx() {
+    return globalThis.SillyTavern?.getContext?.();
+}
+
+function uid(prefix = 'id') {
+    const value = globalThis.crypto?.randomUUID?.() || `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+    return `${prefix}_${value}`;
+}
+
+function clone(value) {
+    return structuredClone(value);
+}
+
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+}
+
+function escapeXml(value) {
+    return escapeHtml(value);
+}
+
+function normalizeSettings() {
+    const context = ctx();
+    if (!context) return null;
+
+    const all = context.extensionSettings;
+    if (!all[STSC_MODULE]) {
+        all[STSC_MODULE] = clone(DEFAULT_SETTINGS);
+    }
+
+    const settings = all[STSC_MODULE];
+    mergeDefaults(settings, DEFAULT_SETTINGS);
+
+    if (!Array.isArray(settings.presets)) settings.presets = [];
+    if (!Array.isArray(settings.references)) settings.references = [];
+    if (!Array.isArray(settings.temporaryInstructions)) settings.temporaryInstructions = [];
+    if (!Array.isArray(settings.pendingInstructionIds)) settings.pendingInstructionIds = [];
+    if (!Array.isArray(settings.persistentInstructionIds)) settings.persistentInstructionIds = [];
+    if (!settings.characterBindings || typeof settings.characterBindings !== 'object') settings.characterBindings = {};
+    if (!settings.appearance || typeof settings.appearance !== 'object') settings.appearance = clone(DEFAULT_SETTINGS.appearance);
+    if (!settings.updateNotice || typeof settings.updateNotice !== 'object') settings.updateNotice = clone(DEFAULT_SETTINGS.updateNotice);
+    settings.updateNotice.lastCheckedAt = Math.max(0, Number(settings.updateNotice.lastCheckedAt) || 0);
+    settings.updateNotice.lastNotifiedAt = Math.max(0, Number(settings.updateNotice.lastNotifiedAt) || 0);
+    settings.updateNotice.lastSeenInstalledVersion = String(settings.updateNotice.lastSeenInstalledVersion || '');
+    settings.updateNotice.lastNotifiedVersion = String(settings.updateNotice.lastNotifiedVersion || '');
+    settings.appearance.theme = ['default', 'rose', 'blue', 'mint', 'violet', 'gold'].includes(settings.appearance.theme) ? settings.appearance.theme : 'default';
+    settings.appearance.floatingEnabled = Boolean(settings.appearance.floatingEnabled);
+    settings.appearance.floatingStyle = ['theme', 'glass', 'solid', 'minimal'].includes(settings.appearance.floatingStyle) ? settings.appearance.floatingStyle : 'theme';
+    // v0.2.4 起该字段表示悬浮按钮背景透明度，不再控制悬浮面板整体。
+    settings.appearance.floatingOpacity = clampNumber(settings.appearance.floatingOpacity, 0.1, 1, 0.94);
+    // v0.3.4：悬浮按钮大小可在 34px 到原始 50px 之间自由调整。
+    settings.appearance.floatingButtonSize = clampNumber(settings.appearance.floatingButtonSize, 34, 50, 50);
+    settings.appearance.floatingWidth = clampNumber(settings.appearance.floatingWidth, 300, 680, 420);
+    settings.appearance.floatingHeight = clampNumber(settings.appearance.floatingHeight, 300, 820, 640);
+    if (!settings.appearance.floatingPosition || typeof settings.appearance.floatingPosition !== 'object') {
+        settings.appearance.floatingPosition = clone(DEFAULT_SETTINGS.appearance.floatingPosition);
+    }
+    // 兼容 v0.1.4 以前“只贴左右边缘”的位置格式，迁移成全屏自由坐标。
+    if (settings.appearance.floatingPosition.leftRatio === undefined) {
+        settings.appearance.floatingPosition.leftRatio = settings.appearance.floatingPosition.side === 'left' ? 0.04 : 0.82;
+    }
+    settings.appearance.floatingPosition.leftRatio = clampNumber(settings.appearance.floatingPosition.leftRatio, 0, 1, 0.82);
+    settings.appearance.floatingPosition.topRatio = clampNumber(settings.appearance.floatingPosition.topRatio, 0, 1, 0.68);
+    delete settings.appearance.floatingPosition.side;
+
+    let settingsMigrated = false;
+    if (settings.presets.length === 0) {
+        const general = createBuiltInGeneralPreset();
+        settings.presets.push(general);
+        settings.generalPresetId = general.id;
+        settings.migrations.defaultGeneralCoreV1 = true;
+        settingsMigrated = true;
+    }
+
+    const legacyGeneralId = settings.generalPresetId || settings.presets[0]?.id || '';
+    const legacyCharacterPresetIds = new Set(Object.values(settings.characterBindings));
+    for (const preset of settings.presets) {
+        if (!preset.kind) {
+            preset.kind = preset.id !== legacyGeneralId && legacyCharacterPresetIds.has(preset.id) ? 'character' : 'general';
+        }
+        normalizePreset(preset);
+    }
+
+    if (!settings.migrations.defaultGeneralCoreV1) {
+        ensureBuiltInGeneralPreset(settings);
+        settings.migrations.defaultGeneralCoreV1 = true;
+        settingsMigrated = true;
+    }
+
+    if (!settings.migrations.defaultGeneralCoreV2) {
+        migrateBuiltInGeneralPresetV2(settings);
+        settings.migrations.defaultGeneralCoreV2 = true;
+        settingsMigrated = true;
+    }
+
+    // v0.2.6：上一版迁移依赖整段文字完全匹配。部分用户的内置题目文本
+    // 曾被旧版本规范化或轻微改写，导致类型没有从判断题改成开放问答。
+    // 这里按“内置预设 + 题目标题”再次修复，已跑过 v0.2.5 的用户也会生效。
+    if (!settings.migrations.defaultGeneralCoreV3) {
+        migrateBuiltInGeneralPresetV3(settings);
+        settings.migrations.defaultGeneralCoreV3 = true;
+        settingsMigrated = true;
+    }
+
+    // v0.2.7：将内置“默认通用自检”的六道核心题全部改为开放问答。
+    // 迁移只处理内置默认预设，不影响用户自行创建的其他预设。
+    if (!settings.migrations.defaultGeneralCoreV4) {
+        migrateBuiltInGeneralPresetV4(settings);
+        settings.migrations.defaultGeneralCoreV4 = true;
+        settingsMigrated = true;
+    }
+
+    let generalPresets = settings.presets.filter(x => x.kind === 'general');
+    if (!generalPresets.length) {
+        const general = createBuiltInGeneralPreset();
+        settings.presets.unshift(general);
+        generalPresets = [general];
+    }
+
+    if (!settings.generalPresetId || !generalPresets.some(x => x.id === settings.generalPresetId)) {
+        settings.generalPresetId = generalPresets[0].id;
+    }
+
+    // 兼容旧版本的“角色 -> 预设”绑定表，并迁移到角色预设本身。
+    for (const [characterKey, presetId] of Object.entries(settings.characterBindings)) {
+        const preset = settings.presets.find(x => x.id === presetId);
+        if (!preset || preset.kind === 'general' || preset.boundCharacterKey) continue;
+        preset.kind = 'character';
+        preset.boundCharacterKey = characterKey;
+        preset.boundCharacterName = findCharacterEntity(characterKey)?.name || preset.boundCharacterName || '原绑定角色';
+    }
+    settings.characterBindings = {};
+
+    const initialGeneral = settings.presets.find(x => x.id === settings.generalPresetId && x.kind === 'general');
+    if (initialGeneral?.name === '通用自检预设') initialGeneral.name = '默认（初始默认）';
+
+    settings.ui.presetSection = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    const oldEditing = settings.presets.find(x => x.id === settings.ui.editingPresetId);
+    if (!settings.ui.editingGeneralPresetId && oldEditing?.kind === 'general') settings.ui.editingGeneralPresetId = oldEditing.id;
+    if (!settings.ui.editingCharacterPresetId && oldEditing?.kind === 'character') settings.ui.editingCharacterPresetId = oldEditing.id;
+
+    if (!generalPresets.some(x => x.id === settings.ui.editingGeneralPresetId)) {
+        settings.ui.editingGeneralPresetId = settings.generalPresetId;
+    }
+    const characterPresets = settings.presets.filter(x => x.kind === 'character');
+    if (!characterPresets.some(x => x.id === settings.ui.editingCharacterPresetId)) {
+        settings.ui.editingCharacterPresetId = characterPresets[0]?.id || '';
+    }
+
+    for (const reference of settings.references) normalizeReference(reference);
+    for (const instruction of settings.temporaryInstructions) normalizeTemporaryInstruction(instruction);
+    const validInstructionIds = new Set(settings.temporaryInstructions.map(instruction => instruction.id));
+    settings.persistentInstructionIds = [...new Set(settings.persistentInstructionIds.filter(id => validInstructionIds.has(id)))];
+    const persistentIds = new Set(settings.persistentInstructionIds);
+    settings.pendingInstructionIds = [...new Set(settings.pendingInstructionIds.filter(id => validInstructionIds.has(id) && !persistentIds.has(id)))];
+
+    if (settingsMigrated) context.saveSettingsDebounced?.();
+    return settings;
+}
+
+function mergeDefaults(target, defaults) {
+    for (const [key, value] of Object.entries(defaults)) {
+        if (!Object.hasOwn(target, key)) {
+            target[key] = clone(value);
+        } else if (value && typeof value === 'object' && !Array.isArray(value) && target[key] && typeof target[key] === 'object' && !Array.isArray(target[key])) {
+            mergeDefaults(target[key], value);
+        }
+    }
+}
+
+function createPreset(name = '新自检预设', kind = 'general') {
+    return {
+        id: uid('preset'),
+        name,
+        kind: kind === 'character' ? 'character' : 'general',
+        enabled: true,
+        questions: [],
+        boundCharacterKey: '',
+        boundCharacterName: '',
+    };
+}
+
+function createBuiltInGeneralPreset() {
+    const preset = createPreset(STSC_BUILTIN_GENERAL_NAME, 'general');
+    preset.builtinKey = STSC_BUILTIN_GENERAL_KEY;
+    preset.questions = [
+        createQuestion('【固定格式完整性】本轮需要输出哪些由角色卡、世界书、参考资料库或当前预设明确要求的固定格式？请逐项确认它们应出现的位置、顺序、标签和字段，并说明如何避免遗漏、重复、擅自改名，或在没有相关要求时自行添加格式。', 'open', 'standard', true),
+        createQuestion('【角色信息边界与上帝视角】本轮角色能够依据哪些已知信息作出判断？请说明这些信息来自亲眼所见、亲耳所闻、他人告知、过往经历还是合理推测，并指出如何避免读取{{user}}或其他角色内心、知晓未曾接触的信息、提前知道场外事件，或把推测写成确定事实。', 'open', 'standard', true),
+        createQuestion('【情绪强度与占有欲】本轮角色会出现怎样的情绪及其强度？请结合角色设定、事件刺激、当前关系阶段与此前情绪积累说明依据，并说明如何避免无铺垫的暴怒、崩溃、嫉妒、偏执或过度占有。若强烈占有欲属于角色设定，应如何将其作为角色的欲望或缺陷体现，同时保留{{user}}的完整人权、独立意志与拒绝权？', 'open', 'standard', true),
+        createQuestion('【关系阶段与亲密行为】当前角色与{{user}}处于什么关系阶段？本轮允许出现怎样的态度、信任、依赖、暧昧、身体接触与情感表达？请说明如何避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认恋爱关系；若角色本身轻浮、冲动或擅长调情，也应区分表面行为与真实感情进度。', 'open', 'standard', true),
+        createQuestion('【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。', 'open', 'standard', true),
+        createQuestion('【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。', 'open', 'standard', true),
+    ];
+    return preset;
+}
+
+function isLegacyInitialGeneralPreset(preset) {
+    if (!preset || preset.kind !== 'general') return false;
+    if (!['默认（初始默认）', '通用自检预设'].includes(String(preset.name || '').trim())) return false;
+    const legacyQuestions = [
+        '当前角色与{{user}}处于什么关系阶段？本轮应当如何表现？',
+        '本轮是否出现了缺少剧情或设定依据的好感、亲密或占有欲？',
+        '本轮是否尊重{{user}}的行动、语言和心理自主权？',
+    ];
+    const actual = (preset.questions || []).map(question => String(question.text || '').trim());
+    return actual.length === legacyQuestions.length && legacyQuestions.every((question, index) => actual[index] === question);
+}
+
+function ensureBuiltInGeneralPreset(settings) {
+    let builtin = settings.presets.find(preset => preset.kind === 'general' && preset.builtinKey === STSC_BUILTIN_GENERAL_KEY);
+    if (builtin) return builtin;
+
+    const current = settings.presets.find(preset => preset.id === settings.generalPresetId && preset.kind === 'general');
+    const shouldReplaceLegacySelection = isLegacyInitialGeneralPreset(current);
+    builtin = createBuiltInGeneralPreset();
+    settings.presets.push(builtin);
+
+    if (shouldReplaceLegacySelection || !settings.generalPresetId) {
+        settings.generalPresetId = builtin.id;
+        if (settings.ui) settings.ui.editingGeneralPresetId = builtin.id;
+    }
+    return builtin;
+}
+
+function migrateBuiltInGeneralPresetV2(settings) {
+    const builtin = ensureBuiltInGeneralPreset(settings);
+    if (!builtin) return;
+
+    const migrations = [
+        {
+            title: '【角色一致性但不僵化】',
+            oldText: '【角色一致性但不僵化】本轮角色的语言、行为、判断与情绪是否能够从其设定、当前处境和已发生事件中得到解释？是否避免为了推动剧情而突然降智、失去原则、改变立场或表现出不属于该角色的习惯？同时是否避免把角色设定机械化，允许角色因具体事件产生合理的犹豫、变化、矛盾和成长。',
+            newText: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+        },
+        {
+            title: '【真实人类表达】',
+            oldText: '【真实人类表达】本轮台词、旁白与心理活动是否符合真实人类在当前场景中的表达习惯？是否避免过度分析、持续总结、堆砌术语、机械解释心理、像报告一样列出结论，或把简单情绪包装成复杂理论？聪明、理性或专业能力应更多通过判断、反应和行动体现，同时保留个人语气、情绪、缺点与认知局限。',
+            newText: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+        },
+    ];
+
+    for (const migration of migrations) {
+        const question = builtin.questions.find(item => String(item.text || '').trim() === migration.oldText);
+        if (!question) continue;
+        question.text = migration.newText;
+        question.type = 'open';
+        question.length = 'standard';
+        question.requireEvidence = true;
+    }
+}
+
+function migrateBuiltInGeneralPresetV3(settings) {
+    const targetPresets = settings.presets.filter(preset =>
+        preset.kind === 'general'
+        && (preset.builtinKey === STSC_BUILTIN_GENERAL_KEY || String(preset.name || '').trim() === STSC_BUILTIN_GENERAL_NAME)
+    );
+
+    const repairs = [
+        {
+            title: '【角色一致性但不僵化】',
+            newText: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+            legacyHints: ['本轮角色的语言、行为、判断与情绪是否能够', '是否避免为了推动剧情而突然降智'],
+        },
+        {
+            title: '【真实人类表达】',
+            newText: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+            legacyHints: ['本轮台词、旁白与心理活动是否符合真实人类', '是否避免过度分析、持续总结'],
+        },
+    ];
+
+    for (const preset of targetPresets) {
+        for (const repair of repairs) {
+            const question = (preset.questions || []).find(item => String(item.text || '').trim().startsWith(repair.title));
+            if (!question) continue;
+
+            const currentText = String(question.text || '').trim();
+            const looksLikeOldDefault = repair.legacyHints.some(hint => currentText.includes(hint));
+            if (looksLikeOldDefault) question.text = repair.newText;
+
+            // 即使文字因旧版空格、标点或本地保存差异没有完全匹配，
+            // 只要仍是内置默认题，就确保题型正确迁移为开放问答。
+            question.type = 'open';
+            question.length = 'standard';
+            question.requireEvidence = true;
+        }
+    }
+}
+
+function migrateBuiltInGeneralPresetV4(settings) {
+    const targetPresets = settings.presets.filter(preset =>
+        preset.kind === 'general'
+        && (preset.builtinKey === STSC_BUILTIN_GENERAL_KEY || String(preset.name || '').trim() === STSC_BUILTIN_GENERAL_NAME)
+    );
+
+    const openQuestions = [
+        {
+            title: '【固定格式完整性】',
+            text: '【固定格式完整性】本轮需要输出哪些由角色卡、世界书、参考资料库或当前预设明确要求的固定格式？请逐项确认它们应出现的位置、顺序、标签和字段，并说明如何避免遗漏、重复、擅自改名，或在没有相关要求时自行添加格式。',
+        },
+        {
+            title: '【角色信息边界与上帝视角】',
+            text: '【角色信息边界与上帝视角】本轮角色能够依据哪些已知信息作出判断？请说明这些信息来自亲眼所见、亲耳所闻、他人告知、过往经历还是合理推测，并指出如何避免读取{{user}}或其他角色内心、知晓未曾接触的信息、提前知道场外事件，或把推测写成确定事实。',
+        },
+        {
+            title: '【情绪强度与占有欲】',
+            text: '【情绪强度与占有欲】本轮角色会出现怎样的情绪及其强度？请结合角色设定、事件刺激、当前关系阶段与此前情绪积累说明依据，并说明如何避免无铺垫的暴怒、崩溃、嫉妒、偏执或过度占有。若强烈占有欲属于角色设定，应如何将其作为角色的欲望或缺陷体现，同时保留{{user}}的完整人权、独立意志与拒绝权？',
+        },
+        {
+            title: '【关系阶段与亲密行为】',
+            text: '【关系阶段与亲密行为】当前角色与{{user}}处于什么关系阶段？本轮允许出现怎样的态度、信任、依赖、暧昧、身体接触与情感表达？请说明如何避免缺乏事件推动的突然心软、突然深爱、突然吃醋、突然表白、突然亲密或默认恋爱关系；若角色本身轻浮、冲动或擅长调情，也应区分表面行为与真实感情进度。',
+        },
+        {
+            title: '【角色一致性但不僵化】',
+            text: '【角色一致性但不僵化】本轮准备如何体现角色的核心性格、立场与个人习惯？角色可能因当前事件产生哪些合理的犹豫、矛盾或变化？请说明如何在避免 OOC 的同时，不把角色演绎成僵硬不变的设定集合。',
+        },
+        {
+            title: '【真实人类表达】',
+            text: '【真实人类表达】本轮角色的台词、旁白和心理活动准备采用怎样的表达方式？请结合当前情境说明如何体现角色个人语气，并避免报告式分析、术语堆砌、长篇说教、机械总结或过度准确地解释心理。',
+        },
+    ];
+
+    for (const preset of targetPresets) {
+        for (const config of openQuestions) {
+            const question = (preset.questions || []).find(item => String(item.text || '').trim().startsWith(config.title));
+            if (!question) continue;
+            question.text = config.text;
+            question.type = 'open';
+            question.length = 'standard';
+            question.requireEvidence = true;
+        }
+    }
+}
+
+function normalizePreset(preset) {
+    preset.id ||= uid('preset');
+    preset.name ||= '未命名预设';
+    preset.kind = preset.kind === 'character' ? 'character' : 'general';
+    if (preset.enabled === undefined) preset.enabled = true;
+    if (!Array.isArray(preset.questions)) preset.questions = [];
+    preset.boundCharacterKey ||= '';
+    preset.boundCharacterName ||= '';
+    preset.builtinKey = String(preset.builtinKey || '');
+    if (preset.kind === 'general') {
+        preset.boundCharacterKey = '';
+        preset.boundCharacterName = '';
+    }
+    for (const question of preset.questions) normalizeQuestion(question);
+}
+
+function createQuestion(text = '', type = 'open', length = 'standard', requireEvidence = true) {
+    return {
+        id: uid('q'),
+        text,
+        type,
+        length,
+        requireEvidence,
+        enabled: true,
+    };
+}
+
+function normalizeQuestion(question) {
+    question.id ||= uid('q');
+    question.text ||= '';
+    question.type = ['open', 'boolean'].includes(question.type) ? question.type : 'open';
+    question.length = ['brief', 'standard', 'detailed'].includes(question.length) ? question.length : 'standard';
+    if (question.requireEvidence === undefined) question.requireEvidence = true;
+    if (question.enabled === undefined) question.enabled = true;
+}
+
+function referenceTypeConfig(type) {
+    return REFERENCE_TYPE_CONFIG[type] || REFERENCE_TYPE_CONFIG.other;
+}
+
+function createReference(name = '新参考资料', type = 'other') {
+    const config = referenceTypeConfig(type);
+    return {
+        id: uid('ref'),
+        name,
+        type: Object.hasOwn(REFERENCE_TYPE_CONFIG, type) ? type : 'other',
+        content: '',
+        enabled: true,
+        scope: 'global',
+        characterKey: '',
+        position: config.position,
+        depth: config.depth,
+        role: config.role,
+        addToCheck: false,
+        autoQuestion: config.autoQuestion,
+    };
+}
+
+function normalizeReference(reference) {
+    reference.type = Object.hasOwn(REFERENCE_TYPE_CONFIG, reference.type) ? reference.type : 'other';
+    const defaults = createReference('新参考资料', reference.type);
+    for (const [key, value] of Object.entries(defaults)) {
+        if (!Object.hasOwn(reference, key)) reference[key] = value;
+    }
+    reference.id ||= uid('ref');
+    reference.name ||= '未命名资料';
+    reference.content ||= '';
+    reference.enabled = Boolean(reference.enabled);
+    reference.scope = reference.scope === 'character' ? 'character' : 'global';
+    reference.characterKey ||= '';
+    reference.position = ['before', 'prompt', 'chat'].includes(reference.position) ? reference.position : defaults.position;
+    reference.role = ['system', 'user', 'assistant'].includes(reference.role) ? reference.role : defaults.role;
+    reference.depth = clampNumber(reference.depth, 0, 20, defaults.depth);
+    reference.addToCheck = Boolean(reference.addToCheck);
+    reference.autoQuestion = String(reference.autoQuestion || defaults.autoQuestion);
+    if (!reference.enabled) reference.addToCheck = false;
+}
+
+function applyReferenceTypeDefaults(reference, nextType, { preserveCustomQuestion = true } = {}) {
+    if (!reference) return;
+    const previousConfig = referenceTypeConfig(reference.type);
+    const nextConfig = referenceTypeConfig(nextType);
+    const currentQuestion = String(reference.autoQuestion || '').trim();
+    const isDefaultQuestion = !currentQuestion || Object.values(REFERENCE_TYPE_CONFIG).some(config => config.autoQuestion === currentQuestion) || currentQuestion === previousConfig.autoQuestion;
+    reference.type = Object.hasOwn(REFERENCE_TYPE_CONFIG, nextType) ? nextType : 'other';
+    reference.position = nextConfig.position;
+    reference.depth = nextConfig.depth;
+    reference.role = nextConfig.role;
+    if (!preserveCustomQuestion || isDefaultQuestion) reference.autoQuestion = nextConfig.autoQuestion;
+}
+
+function createTemporaryInstruction() {
+    return {
+        id: uid('temp'),
+        name: '新快捷指令',
+        content: '',
+    };
+}
+
+function normalizeTemporaryInstruction(instruction) {
+    instruction.id ||= uid('temp');
+    instruction.name ||= '未命名快捷指令';
+    instruction.content ||= '';
+}
+
+function instructionActivationMode(id, settings = getUiSettings()) {
+    if (settings.persistentInstructionIds?.includes(id)) return 'always';
+    if (settings.pendingInstructionIds?.includes(id)) return 'once';
+    return 'off';
+}
+
+function instructionActivationLabel(mode) {
+    return {
+        always: '常开',
+        once: '临时一轮',
+        off: '未启用',
+    }[mode] || '未启用';
+}
+
+function applyInstructionActivation(target, id, mode) {
+    if (!target) return;
+    if (!Array.isArray(target.pendingInstructionIds)) target.pendingInstructionIds = [];
+    if (!Array.isArray(target.persistentInstructionIds)) target.persistentInstructionIds = [];
+
+    target.pendingInstructionIds = target.pendingInstructionIds.filter(value => value !== id);
+    target.persistentInstructionIds = target.persistentInstructionIds.filter(value => value !== id);
+
+    if (mode === 'once') target.pendingInstructionIds.push(id);
+    if (mode === 'always') target.persistentInstructionIds.push(id);
+}
+
+function setInstructionActivation(id, mode) {
+    const actual = normalizeSettings();
+    const instruction = actual.temporaryInstructions.find(item => item.id === id);
+    if (!instruction) return false;
+    if (mode !== 'off' && !String(instruction.content || '').trim()) {
+        toastr.warning('这条指令还没有填写内容，请先在完整管理器中编辑并保存。', '墨提斯之镜 DEV');
+        return false;
+    }
+
+    const normalizedMode = ['off', 'once', 'always'].includes(mode) ? mode : 'off';
+    applyInstructionActivation(actual, id, normalizedMode);
+    if (editDraft) applyInstructionActivation(editDraft, id, normalizedMode);
+    saveSettings();
+    renderCompact();
+    renderStatusTab();
+    renderTemporaryTab();
+    renderFloating();
+    return true;
+}
+
+function clampNumber(value, min, max, fallback) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return fallback;
+    return Math.min(max, Math.max(min, number));
+}
+
+function saveSettings() {
+    ctx()?.saveSettingsDebounced?.();
+}
+
+function getUiSettings() {
+    return editDraft || normalizeSettings();
+}
+
+function beginEditSession() {
+    editDraft = clone(normalizeSettings());
+    editDirty = false;
+    pendingUnsavedAction = null;
+    updateSaveState();
+}
+
+function markDirty() {
+    if (!editDraft) editDraft = clone(normalizeSettings());
+    editDirty = true;
+    updateSaveState();
+}
+
+function commitEditDraft({ notify = true } = {}) {
+    if (!editDraft) return;
+    const context = ctx();
+    if (!context?.extensionSettings) return;
+    context.extensionSettings[STSC_MODULE] = clone(editDraft);
+    const savedSettings = normalizeSettings();
+    if (!savedSettings?.enabled) {
+        // 用户关闭插件后立刻终止尚未完成的本轮检测，避免回复完成时被误判为“未输出自检”。
+        pendingRun = null;
+        strictBusy = false;
+        clearRuntimePrompts();
+    }
+    saveSettings();
+    editDraft = clone(context.extensionSettings[STSC_MODULE]);
+    editDirty = false;
+    applyTheme(editDraft);
+    renderAll();
+    if (notify) toastr.success('更改已保存。', '墨提斯之镜 DEV');
+}
+
+function discardEditDraft({ notify = false } = {}) {
+    editDraft = clone(normalizeSettings());
+    editDirty = false;
+    applyTheme(editDraft);
+    renderAll();
+    if (notify) toastr.info('已放弃未保存的更改。', '墨提斯之镜 DEV');
+}
+
+function updateSaveState() {
+    const $button = $('#stscdev_save_changes');
+    const $state = $('#stscdev_save_state');
+    if (!$button.length) return;
+    $button.prop('disabled', !editDirty).toggleClass('stscdev-save-dirty', editDirty);
+    $state.text(editDirty ? '有未保存的更改' : '已保存').toggleClass('stscdev-unsaved', editDirty);
+}
+
+function runPendingUnsavedAction() {
+    const action = pendingUnsavedAction;
+    pendingUnsavedAction = null;
+    if (typeof action === 'function') action();
+}
+
+function requestUnsavedDecision(action) {
+    if (!editDirty) {
+        action?.();
+        return;
+    }
+    pendingUnsavedAction = action;
+    openDialog(
+        '当前内容尚未保存',
+        '<div class="stscdev-unsaved-message">你刚刚修改的内容还没有保存。请选择保存、放弃更改，或继续留在当前页面。</div>',
+        '<button class="menu_button" type="button" data-dialog-action="unsaved-cancel">继续编辑</button>' +
+        '<button class="menu_button stscdev-danger-button" type="button" data-dialog-action="unsaved-discard">放弃更改</button>' +
+        '<button class="menu_button stscdev-primary-button" type="button" data-dialog-action="unsaved-save">保存并继续</button>'
+    );
+}
+
+function applyTheme(settings = getUiSettings()) {
+    const theme = settings?.appearance?.theme || 'default';
+    $('#stscdev_manager_overlay, #stscdev_dialog_overlay, #stscdev_floating_root, #stscdev_floating_panel').attr('data-stscdev-theme', theme);
+}
+
+function applyFloatingAppearance(settings = getUiSettings()) {
+    const appearance = settings?.appearance || DEFAULT_SETTINGS.appearance;
+    const style = ['theme', 'glass', 'solid', 'minimal'].includes(appearance.floatingStyle) ? appearance.floatingStyle : 'theme';
+    const buttonOpacity = clampNumber(appearance.floatingOpacity, 0.1, 1, 0.94);
+    const buttonSize = clampNumber(appearance.floatingButtonSize, 34, 50, 50);
+    const width = clampNumber(appearance.floatingWidth, 300, 680, 420);
+    const height = clampNumber(appearance.floatingHeight, 300, 820, 640);
+    const panel = document.getElementById('stscdev_floating_panel');
+    const root = document.getElementById('stscdev_floating_root');
+    const button = document.getElementById('stscdev_floating_button');
+    if (!panel) return;
+
+    panel.dataset.floatingStyle = style;
+    panel.style.setProperty('--stscdev-floating-preferred-width', `${Math.round(width)}px`);
+    panel.style.setProperty('--stscdev-floating-preferred-height', `${Math.round(height)}px`);
+    const iconPadding = Math.round(clampNumber(buttonSize * 0.16, 5, 8, 8));
+    const badgeSize = Math.round(clampNumber(buttonSize * 0.38, 15, 19, 19));
+    const badgeFontSize = Math.round(clampNumber(buttonSize * 0.24, 9, 12, 12));
+    const badgeTop = Math.round(clampNumber(buttonSize * -0.08, -4, -3, -4));
+    const badgeRight = Math.round(clampNumber(buttonSize * -0.06, -3, -2, -3));
+    root?.style?.setProperty('--stscdev-floating-button-size', `${Math.round(buttonSize)}px`);
+    root?.style?.setProperty('--stscdev-floating-icon-padding', `${iconPadding}px`);
+    root?.style?.setProperty('--stscdev-floating-badge-size', `${badgeSize}px`);
+    root?.style?.setProperty('--stscdev-floating-badge-font-size', `${badgeFontSize}px`);
+    root?.style?.setProperty('--stscdev-floating-badge-top', `${badgeTop}px`);
+    root?.style?.setProperty('--stscdev-floating-badge-right', `${badgeRight}px`);
+    button?.style?.setProperty('--stscdev-floating-button-opacity-percent', `${Math.round(buttonOpacity * 100)}%`);
+
+    $('#stscdev_floating_opacity_value').text(`${Math.round(buttonOpacity * 100)}%`);
+    $('#stscdev_floating_button_size_value').text(`${Math.round(buttonSize)}px`);
+    $('#stscdev_floating_width_value').text(`${Math.round(width)}px`);
+    $('#stscdev_floating_height_value').text(`${Math.round(height)}px`);
+}
+
+function visibleRect(selector) {
+    const element = document.querySelector(selector);
+    if (!element) return null;
+    const style = getComputedStyle(element);
+    if (style.display === 'none' || style.visibility === 'hidden') return null;
+    const rect = element.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return rect;
+}
+
+function floatingViewportMetrics() {
+    const button = document.getElementById('stscdev_floating_button');
+    const size = Math.max(46, button?.getBoundingClientRect?.().width || 50);
+    const compact = window.matchMedia?.('(max-width: 700px)')?.matches;
+    const margin = compact ? 8 : 14;
+    const viewportHeight = window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 800;
+    const viewportWidth = window.visualViewport?.width || window.innerWidth || document.documentElement.clientWidth || 1200;
+
+    // 尽量避开 SillyTavern 顶部菜单；找不到时使用安全预留值。
+    const topSelectors = ['#top-bar', '#top-settings-holder', '.top-bar', '#sheld'];
+    let topSafe = compact ? 52 : 44;
+    for (const selector of topSelectors) {
+        const rect = visibleRect(selector);
+        if (rect && rect.top <= 8 && rect.bottom < viewportHeight * 0.35) {
+            topSafe = Math.max(topSafe, rect.bottom + margin);
+        }
+    }
+
+    // 尽量避开输入框和底部操作栏；找不到时使用安全预留值。
+    const bottomSelectors = ['#send_form', '#form_sheld', '#send_textarea', '.send_form'];
+    let bottomSafe = compact ? 94 : 76;
+    for (const selector of bottomSelectors) {
+        const rect = visibleRect(selector);
+        if (rect && rect.top > viewportHeight * 0.45 && rect.top < viewportHeight) {
+            bottomSafe = Math.max(bottomSafe, viewportHeight - rect.top + margin);
+        }
+    }
+
+    const minLeft = margin;
+    const maxLeft = Math.max(minLeft, viewportWidth - size - margin);
+    const minTop = Math.min(Math.max(margin, topSafe), Math.max(margin, viewportHeight - size - margin));
+    const maxTop = Math.max(minTop, viewportHeight - size - bottomSafe);
+    return { size, margin, viewportHeight, viewportWidth, minLeft, maxLeft, minTop, maxTop, topSafe, bottomSafe };
+}
+
+function applyFloatingPosition(settings = getUiSettings()) {
+    const root = document.getElementById('stscdev_floating_root');
+    if (!root) return;
+    const position = settings?.appearance?.floatingPosition || DEFAULT_SETTINGS.appearance.floatingPosition;
+    const { minLeft, maxLeft, minTop, maxTop, viewportWidth, viewportHeight, topSafe, bottomSafe } = floatingViewportMetrics();
+    const leftRatio = clampNumber(position.leftRatio, 0, 1, 0.82);
+    const topRatio = clampNumber(position.topRatio, 0, 1, 0.68);
+    const left = minLeft + (maxLeft - minLeft) * leftRatio;
+    const top = minTop + (maxTop - minTop) * topRatio;
+
+    root.style.setProperty('--stscdev-safe-top', `${Math.round(topSafe)}px`);
+    root.style.setProperty('--stscdev-safe-bottom', `${Math.round(bottomSafe)}px`);
+    root.style.left = `${Math.round(left)}px`;
+    root.style.right = 'auto';
+    root.style.top = `${Math.round(top)}px`;
+    root.style.bottom = 'auto';
+    root.dataset.horizontal = left + 25 > viewportWidth / 2 ? 'right' : 'left';
+    root.dataset.vertical = top + 25 > viewportHeight / 2 ? 'bottom' : 'top';
+}
+
+function persistFloatingPosition(left, top) {
+    const actual = normalizeSettings();
+    if (!actual) return;
+    const { minLeft, maxLeft, minTop, maxTop } = floatingViewportMetrics();
+    const safeLeft = clampNumber(left, minLeft, maxLeft, minLeft);
+    const safeTop = clampNumber(top, minTop, maxTop, minTop);
+    const next = {
+        leftRatio: clampNumber((safeLeft - minLeft) / Math.max(1, maxLeft - minLeft), 0, 1, 0.82),
+        topRatio: clampNumber((safeTop - minTop) / Math.max(1, maxTop - minTop), 0, 1, 0.68),
+    };
+    actual.appearance.floatingPosition = next;
+    if (editDraft?.appearance) editDraft.appearance.floatingPosition = clone(next);
+    saveSettings();
+    applyFloatingPosition(editDraft || actual);
+}
+
+function floatingVisualViewport() {
+    const visual = window.visualViewport;
+    const left = Number.isFinite(visual?.offsetLeft) ? visual.offsetLeft : 0;
+    const top = Number.isFinite(visual?.offsetTop) ? visual.offsetTop : 0;
+    const width = Math.max(240, visual?.width || window.innerWidth || document.documentElement.clientWidth || 390);
+    const height = Math.max(260, visual?.height || window.innerHeight || document.documentElement.clientHeight || 700);
+    return { left, top, width, height, right: left + width, bottom: top + height };
+}
+
+function floatingPanelBoundaries(viewport) {
+    const compact = window.matchMedia?.('(max-width: 720px)')?.matches || (window.matchMedia?.('(pointer: coarse)')?.matches && viewport.width < 900);
+    const margin = compact ? 8 : 14;
+    let topBoundary = viewport.top + margin;
+    let bottomBoundary = viewport.bottom - margin;
+
+    const topSelectors = ['#top-bar', '#top-settings-holder', '.top-bar', '#sheld'];
+    for (const selector of topSelectors) {
+        const rect = visibleRect(selector);
+        if (!rect) continue;
+        const height = Math.max(0, Math.min(rect.bottom, viewport.bottom) - Math.max(rect.top, viewport.top));
+        const startsAtTop = rect.top <= viewport.top + 36;
+        const plausibleBar = height >= 24 && height <= Math.min(140, viewport.height * 0.26);
+        if (startsAtTop && plausibleBar) topBoundary = Math.max(topBoundary, Math.min(rect.bottom + margin, viewport.top + 140));
+    }
+
+    const bottomSelectors = ['#send_form', '#form_sheld', '#send_textarea', '.send_form'];
+    for (const selector of bottomSelectors) {
+        const rect = visibleRect(selector);
+        if (!rect) continue;
+        const intersectsBottom = rect.bottom >= viewport.bottom - 48 && rect.top < viewport.bottom;
+        const plausibleInput = rect.height >= 34 && rect.height <= Math.min(260, viewport.height * 0.38);
+        if (intersectsBottom && plausibleInput) bottomBoundary = Math.min(bottomBoundary, rect.top - margin);
+    }
+
+    // 某些移动浏览器会让顶部/底部检测值互相挤压。空间不足时直接回退到视觉视口，绝不让面板塌成一条线。
+    const minimumPanelHeight = Math.min(300, Math.max(220, viewport.height - margin * 2));
+    if (bottomBoundary - topBoundary < minimumPanelHeight) {
+        topBoundary = viewport.top + margin;
+        bottomBoundary = viewport.bottom - margin;
+    }
+
+    return { compact, margin, topBoundary, bottomBoundary };
+}
+
+function setImportantStyle(element, property, value) {
+    element?.style?.setProperty?.(property, value, 'important');
+}
+
+function layoutFloatingPanel() {
+    const panel = document.getElementById('stscdev_floating_panel');
+    if (!panel || panel.classList.contains('stscdev-hidden')) return;
+
+    const viewport = floatingVisualViewport();
+    const { compact, margin, topBoundary, bottomBoundary } = floatingPanelBoundaries(viewport);
+    const appearance = getUiSettings()?.appearance || DEFAULT_SETTINGS.appearance;
+    const preferredWidth = clampNumber(appearance.floatingWidth, 300, 680, 420);
+    const preferredHeight = clampNumber(appearance.floatingHeight, 300, 820, 640);
+    setImportantStyle(panel, 'position', 'fixed');
+    setImportantStyle(panel, 'right', 'auto');
+    setImportantStyle(panel, 'bottom', 'auto');
+    setImportantStyle(panel, 'transform', 'none');
+    setImportantStyle(panel, 'box-sizing', 'border-box');
+    setImportantStyle(panel, 'display', 'flex');
+
+    if (compact) {
+        const availableWidth = Math.max(240, viewport.width - margin * 2);
+        const availableHeight = Math.max(220, bottomBoundary - topBoundary);
+        const width = Math.min(availableWidth, Math.max(240, preferredWidth));
+        const height = Math.min(availableHeight, Math.max(220, preferredHeight));
+        const left = viewport.left + Math.max(margin, (viewport.width - width) / 2);
+        const top = topBoundary + Math.max(0, (availableHeight - height) / 2);
+        setImportantStyle(panel, 'left', `${Math.round(left)}px`);
+        setImportantStyle(panel, 'top', `${Math.round(top)}px`);
+        setImportantStyle(panel, 'width', `${Math.round(width)}px`);
+        setImportantStyle(panel, 'height', `${Math.round(height)}px`);
+        setImportantStyle(panel, 'max-width', 'none');
+        setImportantStyle(panel, 'max-height', 'none');
+        panel.dataset.layout = 'mobile';
+        return;
+    }
+
+    const button = document.getElementById('stscdev_floating_button');
+    const buttonRect = button?.getBoundingClientRect?.() || { left: viewport.right - 64, right: viewport.right - 14, top: viewport.top + 90, bottom: viewport.top + 140 };
+    const width = Math.min(preferredWidth, viewport.width - margin * 2);
+    const height = Math.min(preferredHeight, Math.max(220, viewport.height - margin * 2));
+    const openLeft = buttonRect.left + buttonRect.width / 2 < viewport.left + viewport.width / 2;
+    const openDown = buttonRect.top + buttonRect.height / 2 < viewport.top + viewport.height / 2;
+    const desiredLeft = openLeft ? buttonRect.left : buttonRect.right - width;
+    const desiredTop = openDown ? buttonRect.bottom + 10 : buttonRect.top - height - 10;
+    const left = clampNumber(desiredLeft, viewport.left + margin, viewport.right - width - margin, viewport.left + margin);
+    const top = clampNumber(desiredTop, viewport.top + margin, viewport.bottom - height - margin, viewport.top + margin);
+
+    setImportantStyle(panel, 'left', `${Math.round(left)}px`);
+    setImportantStyle(panel, 'top', `${Math.round(top)}px`);
+    setImportantStyle(panel, 'width', `${Math.round(width)}px`);
+    setImportantStyle(panel, 'height', `${Math.round(height)}px`);
+    setImportantStyle(panel, 'max-width', 'none');
+    setImportantStyle(panel, 'max-height', 'none');
+    panel.dataset.layout = 'desktop';
+}
+
+function toggleFloatingPanel(forceOpen = null) {
+    const panel = document.getElementById('stscdev_floating_panel');
+    if (!panel) return;
+    const $panel = $(panel);
+    const shouldOpen = forceOpen === null ? $panel.hasClass('stscdev-hidden') : Boolean(forceOpen);
+
+    if (!shouldOpen) {
+        // layoutFloatingPanel 会写入 inline display:flex!important。关闭时必须先移除，
+        // 否则移动端的 .stscdev-hidden 无法覆盖内联 important，表现为关闭按钮失效。
+        panel.style.removeProperty('display');
+        $panel.addClass('stscdev-hidden').attr('aria-hidden', 'true');
+        return;
+    }
+
+    $panel.removeClass('stscdev-hidden').attr('aria-hidden', 'false');
+    renderFloating();
+    if (floatingPanelPage === 'check') void markLatestIssueViewed();
+    requestAnimationFrame(() => {
+        layoutFloatingPanel();
+        panel.focus?.({ preventScroll: true });
+    });
+    setTimeout(layoutFloatingPanel, 80);
+}
+
+function beginFloatingDrag(event) {
+    if (event.button !== undefined && event.button !== 0) return;
+    const root = document.getElementById('stscdev_floating_root');
+    const button = document.getElementById('stscdev_floating_button');
+    if (!root || !button) return;
+    const rect = root.getBoundingClientRect();
+    floatingDragState = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        startLeft: rect.left,
+        startTop: rect.top,
+        moved: false,
+    };
+    button.setPointerCapture?.(event.pointerId);
+    root.classList.add('stscdev-floating-dragging');
+}
+
+function moveFloatingDrag(event) {
+    const state = floatingDragState;
+    const root = document.getElementById('stscdev_floating_root');
+    if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
+    const { minLeft, maxLeft, minTop, maxTop } = floatingViewportMetrics();
+    const dx = event.clientX - state.startX;
+    const dy = event.clientY - state.startY;
+    if (!state.moved && Math.hypot(dx, dy) > 6) {
+        state.moved = true;
+        toggleFloatingPanel(false);
+    }
+    if (!state.moved) return;
+
+    const left = clampNumber(state.startLeft + dx, minLeft, maxLeft, minLeft);
+    const top = clampNumber(state.startTop + dy, minTop, maxTop, minTop);
+    root.style.left = `${Math.round(left)}px`;
+    root.style.right = 'auto';
+    root.style.top = `${Math.round(top)}px`;
+    root.style.bottom = 'auto';
+    event.preventDefault();
+}
+
+function endFloatingDrag(event) {
+    const state = floatingDragState;
+    const root = document.getElementById('stscdev_floating_root');
+    const button = document.getElementById('stscdev_floating_button');
+    if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
+    floatingDragState = null;
+    button?.releasePointerCapture?.(event.pointerId);
+    root.classList.remove('stscdev-floating-dragging');
+
+    if (event.type === 'pointercancel') return;
+
+    if (state.moved) {
+        const rect = root.getBoundingClientRect();
+        persistFloatingPosition(rect.left, rect.top);
+        suppressFloatingClickUntil = Date.now() + 450;
+        event.preventDefault();
+    }
+}
+
+function characterEntityFrom(character, index = '') {
+    if (!character) return { key: '', name: '', index: -1 };
+    const stableKey = character.avatar || character.data?.avatar || character.data?.name || character.name || String(index);
+    return {
+        key: `character:${stableKey}`,
+        name: character.name || character.data?.name || '未命名角色',
+        index: Number(index),
+    };
+}
+
+function getAllCharacterEntities() {
+    const characters = ctx()?.characters;
+    if (!Array.isArray(characters)) return [];
+    return characters.map((character, index) => characterEntityFrom(character, index)).filter(x => x.key);
+}
+
+function findCharacterEntity(key) {
+    if (!key) return null;
+    return getAllCharacterEntities().find(x => x.key === key) || null;
+}
+
+function getCurrentCharacterEntity() {
+    const context = ctx();
+    if (!context || context.groupId) return { key: '', name: '未找到角色', index: -1 };
+    const character = context.characters?.[Number(context.characterId)];
+    if (!character) return { key: '', name: '未找到角色', index: -1 };
+    return characterEntityFrom(character, Number(context.characterId));
+}
+
+function getCurrentEntity() {
+    const context = ctx();
+    if (!context) return { key: '', name: '未选择角色' };
+
+    if (context.groupId) {
+        const group = context.groups?.find?.(x => String(x.id) === String(context.groupId));
+        return { key: `group:${context.groupId}`, name: group?.name || '当前群聊' };
+    }
+
+    const character = getCurrentCharacterEntity();
+    return character.key ? character : { key: '', name: '未选择角色' };
+}
+
+function getCurrentChatId() {
+    const context = ctx();
+    return String(context?.getCurrentChatId?.() ?? context?.chatId ?? '');
+}
+
+function getPresetById(id, settings = normalizeSettings()) {
+    return settings?.presets.find(x => x.id === id) || null;
+}
+
+function getBoundPreset(settings = normalizeSettings()) {
+    const character = getCurrentCharacterEntity();
+    if (!character.key) return null;
+    return settings.presets.find(x => x.kind === 'character' && x.boundCharacterKey === character.key) || null;
+}
+
+function getPresetBindingState(preset) {
+    if (!preset || preset.kind !== 'character' || !preset.boundCharacterKey) {
+        return { status: 'unbound', name: '未绑定' };
+    }
+    const character = findCharacterEntity(preset.boundCharacterKey);
+    if (character) return { status: 'ok', name: character.name };
+    return { status: 'missing', name: preset.boundCharacterName || '未知角色' };
+}
+
+function referenceApplies(reference) {
+    if (!reference.enabled || !reference.content.trim()) return false;
+    if (reference.scope === 'global') return true;
+    const entity = getCurrentEntity();
+    return Boolean(entity.key && reference.characterKey === entity.key);
+}
+
+function getActiveReferences(settings = normalizeSettings()) {
+    return settings.references.filter(referenceApplies);
+}
+
+function makeReferenceQuestion(reference) {
+    const config = referenceTypeConfig(reference.type);
+    const text = String(reference.autoQuestion || config.autoQuestion || '')
+        .replaceAll('{{name}}', reference.name || '未命名资料')
+        .trim() || `请说明本轮是否遵守了【${reference.name || '未命名资料'}】。`;
+
+    return {
+        id: `ref_${reference.id}`,
+        text,
+        type: 'open',
+        length: 'standard',
+        requireEvidence: true,
+        enabled: true,
+        source: `参考资料库-${config.label}-${reference.name}`,
+    };
+}
+
+function getActiveQuestions(settings = normalizeSettings()) {
+    const result = [];
+    const general = settings.presets.find(x => x.id === settings.generalPresetId);
+    const character = getBoundPreset(settings);
+
+    if (settings.generalEnabled && general?.enabled) {
+        for (const question of general.questions.filter(x => x.enabled && x.text.trim())) {
+            result.push({ ...clone(question), source: `通用自检预设-${general.name}` });
+        }
+    }
+
+    if (settings.characterEnabled && character?.enabled && character.id !== general?.id) {
+        for (const question of character.questions.filter(x => x.enabled && x.text.trim())) {
+            result.push({ ...clone(question), source: `角色自检预设-${character.name}` });
+        }
+    }
+
+    for (const reference of getActiveReferences(settings)) {
+        if (reference.addToCheck) result.push(makeReferenceQuestion(reference));
+    }
+
+    return result;
+}
+
+function getSelectedTemporaryInstructions({ consume = false, settings = null } = {}) {
+    settings ||= normalizeSettings();
+    const persistentSet = new Set(settings.persistentInstructionIds || []);
+    const pendingSet = new Set(settings.pendingInstructionIds || []);
+    const selected = settings.temporaryInstructions
+        .filter(instruction => (persistentSet.has(instruction.id) || pendingSet.has(instruction.id)) && instruction.content.trim())
+        .map(instruction => ({
+            ...instruction,
+            activation: persistentSet.has(instruction.id) ? 'always' : 'once',
+        }));
+
+    if (consume && settings.pendingInstructionIds.length) {
+        settings.pendingInstructionIds = [];
+        if (editDraft) editDraft.pendingInstructionIds = [];
+        saveSettings();
+        renderAll();
+    }
+
+    return selected;
+}
+
+function positionLabel(position) {
+    return {
+        before: '系统最前（默认）',
+        prompt: '主提示词内',
+        chat: '聊天深度',
+    }[position] || position;
+}
+
+function lengthInstruction(length) {
+    return {
+        brief: '简短：一句话或非常精炼的结论',
+        standard: '标准：一至三句话，说明结论和必要依据',
+        detailed: '详细：充分说明结论、依据、风险与修正方向',
+    }[length] || '标准回答';
+}
+
+function buildQuestionXml(questions) {
+    return questions.map((question, index) => {
+        const typeRule = question.type === 'boolean'
+            ? '判断题：<answer>必须以“是”或“否”开头，再补充具体说明。'
+            : '开放问答题：<answer>必须给出具体结论，不得只写“已注意”“会遵守”。';
+        const evidenceRule = question.requireEvidence
+            ? '必须另外输出非空的<evidence>，写明可核对的剧情依据、角色设定依据或世界观依据；不得把依据只混写在<answer>里。'
+            : '无需强制输出<evidence>；回答必须明确。';
+        const requiredFields = question.requireEvidence ? 'answer,evidence' : 'answer';
+        return [
+            `<question id="${escapeXml(question.id)}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
+            `<text>${escapeXml(question.text)}</text>`,
+            `<source>${escapeXml(question.source || '')}</source>`,
+            `<type>${typeRule}</type>`,
+            `<length>${lengthInstruction(question.length)}</length>`,
+            `<evidence_rule>${evidenceRule}</evidence_rule>`,
+            `<required_fields>${requiredFields}</required_fields>`,
+            `</question>`,
+        ].join('\n');
+    }).join('\n');
+}
+
+function buildSinglePrompt(questions) {
+    return `
+[墨提斯之镜 DEV 插件｜强制执行]
+你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他正常正文格式之前，完成下面全部自检问题。
+
+兼容规则：
+- 本插件不得压制、替换、改写或省略用户预设、模型接口或 SillyTavern 原本要求的 thinking / reasoning 内容。
+- 如果原预设要求先输出 <thinking>、<think>、<reasoning> 或其他推理块，请先按原规则完整输出该推理块；随后输出插件自检；最后再输出正文。
+- <stscdev_self_check> 只需位于正文之前，不要求位于原生思维链或推理块之前。
+
+执行规则：
+1. 先依据当前角色卡、世界观、聊天记录和用户最后一条消息，逐题形成最终写作结论。
+2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先修正写作方案，再重新核对。
+3. 自检区只输出最终可供核对的简洁答案，不得把插件问答混入原生 thinking / reasoning 区域。
+4. 不得漏题、合并题目或改变题目编号。
+5. 自检完成前不得开始角色扮演正文；原预设要求的思维链或推理块不属于正文，可正常位于自检之前。
+6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
+7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
+
+你必须严格输出以下结构：
+（如原预设要求，先正常输出其 thinking / reasoning 内容）
+<stscdev_self_check>
+无需依据：<item id="题目ID"><answer>最终回答</answer></item>
+需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
+</stscdev_self_check>
+紧接着直接输出正文、状态栏以及用户要求的全部正常输出格式。
+正文不得再包裹在任何由本插件添加的标签中。
+
+本轮问题：
+${buildQuestionXml(questions)}
+`.trim();
+}
+
+function buildStrictCheckPrompt(questions) {
+    return `
+这是“双阶段严格模式”的第一阶段。请只完成墨提斯之镜 DEV，不得输出角色扮演正文、对白、动作描写或状态栏。
+
+请结合当前角色卡、世界观、聊天记录和用户最后一条消息，逐题给出最终写作结论。发现潜在冲突时，先调整本轮写作计划，再给出最终答案。本阶段只规定插件自检的输出格式，不修改用户原预设的思维链规则。
+
+严格输出：
+<stscdev_self_check>
+无需依据：<item id="题目ID"><answer>最终回答</answer></item>
+需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体剧情、角色设定或世界观依据</evidence></item>
+</stscdev_self_check>
+
+凡问题标记 evidence_required="true"，<evidence>不得省略、不得为空，也不得只把依据混写在<answer>中。
+
+本轮问题：
+${buildQuestionXml(questions)}
+`.trim();
+}
+
+function buildStrictMainPrompt(questions, checkText) {
+    return `
+[墨提斯之镜 DEV 插件｜双阶段严格模式第二阶段]
+下面是本轮已经完成的墨提斯之镜 DEV。你必须严格依据这些结论生成正文，不得与其冲突，也不得重新输出自检内容。
+
+<stscdev_completed_self_check>
+${checkText}
+</stscdev_completed_self_check>
+
+对应问题：
+${buildQuestionXml(questions)}
+
+按照用户原预设正常输出其要求的 thinking / reasoning 内容、正文、状态栏以及全部正常输出格式。
+不要重复输出 <stscdev_self_check>，也不要给正文或原生思维链添加任何由本插件定义的包裹标签。
+`.trim();
+}
+
+function buildReferencePrompt(reference) {
+    const config = referenceTypeConfig(reference.type);
+    return `
+[墨提斯之镜 DEV 插件｜参考资料库｜${config.promptTitle}：${reference.name}]
+${config.promptLead}
+
+${reference.content.trim()}
+`.trim();
+}
+
+function buildTemporaryPrompt(instructions) {
+    const items = instructions.map((instruction, index) => {
+        const modeLabel = instruction.activation === 'always' ? '常开' : '临时一轮';
+        return `${index + 1}. 【${instruction.name}｜${modeLabel}】${instruction.content.trim()}`;
+    }).join('\n');
+    return `
+[墨提斯之镜 DEV 插件｜本轮启用的快捷指令]
+以下指令必须落实到本次回复中，不得在正文中复述、解释或暴露这些指令：
+${items}
+`.trim();
+}
+
+function setRuntimePrompt(key, text, config) {
+    const context = ctx();
+    if (!context?.setExtensionPrompt) return;
+    const position = POSITION_MAP[config.position] ?? POSITION_MAP.before;
+    const depth = clampNumber(config.depth, 0, 20, 0);
+    const role = ROLE_MAP[config.role] ?? ROLE_MAP.system;
+    context.setExtensionPrompt(key, text, position, depth, false, role);
+    runtimePromptKeys.add(key);
+}
+
+function clearRuntimePrompts() {
+    const context = ctx();
+    if (!context?.setExtensionPrompt) return;
+    for (const key of runtimePromptKeys) {
+        try {
+            context.setExtensionPrompt(key, '', -1, 0, false, 0);
+        } catch (error) {
+            console.warn('[STSC] 清理注入失败：', key, error);
+        }
+    }
+    runtimePromptKeys.clear();
+}
+
+function applyReferencePrompts(references) {
+    for (const reference of references) {
+        setRuntimePrompt(`stscdev_ref_${reference.id}`, buildReferencePrompt(reference), reference);
+    }
+}
+
+function applyTemporaryPrompt(instructions, injection) {
+    if (!instructions.length) return;
+    setRuntimePrompt('stscdev_one_shot', buildTemporaryPrompt(instructions), injection);
+}
+
+async function saveLatestResult(result) {
+    const context = ctx();
+    if (!context?.chatMetadata) return;
+    context.chatMetadata[STSC_CHAT_META_KEY] = result;
+    try {
+        context.saveMetadataDebounced?.();
+    } catch (error) {
+        console.warn('[STSC] 保存聊天自检元数据失败：', error);
+    }
+}
+
+function getLatestResult() {
+    return ctx()?.chatMetadata?.[STSC_CHAT_META_KEY] || null;
+}
+
+function latestHasUnreadIssue(latest = getLatestResult()) {
+    return Boolean(latest && ['missing', 'format_error'].includes(latest.status) && latest.issueViewed !== true);
+}
+
+async function markLatestIssueViewed() {
+    const latest = getLatestResult();
+    if (!latest || !['missing', 'format_error'].includes(latest.status) || latest.issueViewed === true) return;
+    latest.issueViewed = true;
+    $('#stscdev_floating_badge').addClass('stscdev-hidden');
+    await saveLatestResult(latest);
+}
+
+function parseItems(checkInner) {
+    const items = [];
+    const itemRegex = /<item\s+[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/item>/gi;
+    let match;
+    while ((match = itemRegex.exec(checkInner)) !== null) {
+        const id = match[1].trim();
+        const itemBody = match[2];
+        const answerMatch = itemBody.match(/<answer[^>]*>([\s\S]*?)<\/answer>/i);
+        const evidenceMatch = itemBody.match(/<evidence[^>]*>([\s\S]*?)<\/evidence>/i);
+        const answer = (answerMatch?.[1] ?? '').trim();
+        const evidence = (evidenceMatch?.[1] ?? '').trim();
+        items.push({ id, answer, evidence });
+    }
+    return items;
+}
+
+function unwrapResponse(text) {
+    // 兼容极早期版本的 <stscdev_response> 标签，但绝不删除标签之前的内容。
+    const source = String(text ?? '');
+    const open = STSC_RESPONSE_OPEN_RE.exec(source);
+    if (!open) return source.trim();
+
+    const afterOpenStart = open.index + open[0].length;
+    const afterOpen = source.slice(afterOpenStart);
+    const close = STSC_RESPONSE_CLOSE_RE.exec(afterOpen);
+    if (!close) return source.trim();
+
+    const closeEnd = afterOpenStart + close.index + close[0].length;
+    return `${source.slice(0, open.index)}${source.slice(afterOpenStart, afterOpenStart + close.index)}${source.slice(closeEnd)}`.trim();
+}
+
+function removeSelfCheckBlocks(text) {
+    const source = String(text ?? '');
+    // 只删除完整闭合的插件自检块。标签前后的 thinking、reasoning、正文及其他自定义格式全部原样保留。
+    return source
+        .replace(/<stscdev_self_check\b[^>]*>[\s\S]*?<\/stscdev_self_check>/gi, '')
+        .trim();
+}
+
+function extractVisibleBody(text) {
+    // 自检标签未闭合时不做破坏性裁切，避免误吞原生思维链或后续正文。
+    return removeSelfCheckBlocks(text);
+}
+
+function parseModelOutput(text, expectedQuestions = []) {
+    const source = String(text ?? '');
+    const openMatch = STSC_CHECK_OPEN_RE.exec(source);
+    const closeMatch = STSC_CHECK_CLOSE_RE.exec(source);
+    const result = {
+        status: 'missing',
+        formatIssues: [],
+        rawCheck: '',
+        body: extractVisibleBody(source),
+        items: [],
+        answers: [],
+    };
+
+    if (!openMatch) {
+        result.formatIssues.push('完全没有输出 <stscdev_self_check>。');
+        return result;
+    }
+
+    if (!closeMatch || closeMatch.index < openMatch.index) {
+        result.status = 'format_error';
+        result.formatIssues.push('自检标签没有正确闭合。');
+        return result;
+    }
+
+    const innerStart = openMatch.index + openMatch[0].length;
+    const inner = source.slice(innerStart, closeMatch.index).trim();
+    result.rawCheck = inner;
+    result.items = parseItems(inner);
+    // 仅精准移除 <stscdev_self_check>…</stscdev_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
+    result.body = extractVisibleBody(source);
+
+    const itemMap = new Map(result.items.map(item => [item.id, item]));
+    result.answers = expectedQuestions.map(question => {
+        const item = itemMap.get(question.id) || {};
+        return {
+            id: question.id,
+            question: question.text,
+            source: question.source || '',
+            type: question.type || 'open',
+            requireEvidence: Boolean(question.requireEvidence),
+            answer: item.answer || '',
+            evidence: item.evidence || '',
+        };
+    });
+
+    for (const answer of result.answers) {
+        if (!answer.answer.trim()) {
+            result.formatIssues.push(`缺少问题“${answer.question}”的回答。`);
+        }
+        if (answer.type === 'boolean' && answer.answer.trim() && !/^(是|否)(?:[，。；：:、\s]|$)/.test(answer.answer.trim())) {
+            result.formatIssues.push(`判断题“${answer.question}”的回答没有以“是”或“否”开头。`);
+        }
+        if (answer.requireEvidence && !answer.evidence.trim()) {
+            result.formatIssues.push(`问题“${answer.question}”已勾选需要依据，但AI没有输出独立的<evidence>依据。`);
+        }
+    }
+
+    if (result.items.length !== expectedQuestions.length) {
+        result.formatIssues.push(`应回答 ${expectedQuestions.length} 题，实际识别到 ${result.items.length} 题。`);
+    }
+
+    result.status = result.formatIssues.length ? 'format_error' : 'ok';
+    return result;
+}
+
+function resolveMessageId(data) {
+    const context = ctx();
+    if (typeof data === 'number') return data;
+    if (typeof data === 'string' && /^\d+$/.test(data)) return Number(data);
+    if (data && typeof data === 'object') {
+        const candidate = data.messageId ?? data.message_id ?? data.id ?? data.mesId;
+        if (candidate !== undefined && /^\d+$/.test(String(candidate))) return Number(candidate);
+    }
+    return Math.max(0, (context?.chat?.length || 1) - 1);
+}
+
+function updateMessageText(message, body) {
+    // 只改写可见正文文本，不读取、不覆盖 message.extra.reasoning 或各 swipe 的 reasoning 数据。
+    message.mes = body;
+    if (Array.isArray(message.swipes) && Number.isInteger(message.swipe_id) && message.swipes[message.swipe_id] !== undefined) {
+        message.swipes[message.swipe_id] = body;
+    }
+}
+
+function refreshMessageDom(messageId, message) {
+    const context = ctx();
+    const id = Number(messageId);
+    try {
+        context?.updateMessageBlock?.(id, message);
+    } catch (error) {
+        console.warn('[STSC] 刷新已剥离自检的正文失败：', error);
+    }
+}
+
+function makeLatestResult({ parsed, questions, mode, messageId, strictRaw = '', strictStatus = '' }) {
+    const entity = getCurrentEntity();
+    const boundPreset = getBoundPreset();
+    const settings = normalizeSettings();
+
+    const status = strictStatus || parsed.status;
+    return {
+        version: STSC_VERSION,
+        timestamp: Date.now(),
+        chatId: getCurrentChatId(),
+        messageId,
+        characterKey: entity.key,
+        characterName: entity.name,
+        mode,
+        status,
+        issueViewed: !['missing', 'format_error'].includes(status),
+        formatIssues: parsed.formatIssues || [],
+        rawCheck: strictRaw || parsed.rawCheck || '',
+        answers: parsed.answers || [],
+        expectedCount: questions.length,
+        answeredCount: (parsed.answers || []).filter(x => x.answer?.trim()).length,
+        generalPresetName: settings.generalEnabled ? getPresetById(settings.generalPresetId)?.name || '' : '',
+        characterPresetName: settings.characterEnabled ? boundPreset?.name || '' : '',
+    };
+}
+
+function statusText(status) {
+    return {
+        ok: '自检完整',
+        format_error: '本轮自检格式有误',
+        missing: '本轮AI未输出自检问答',
+        strict_ok: '双阶段自检已完成',
+    }[status] || '暂无状态';
+}
+
+function statusIcon(status) {
+    return {
+        ok: '✓',
+        strict_ok: '✓',
+        format_error: '⚠',
+        missing: '!',
+    }[status] || '○';
+}
+
+function statusClass(status) {
+    if (status === 'ok' || status === 'strict_ok') return 'stscdev-status-ok';
+    if (status === 'format_error') return 'stscdev-status-warning';
+    if (status === 'missing') return 'stscdev-status-error';
+    return '';
+}
+
+async function handleMessageReceived(data) {
+    if (internalQuietActive) return;
+
+    const settings = normalizeSettings();
+    if (!settings?.enabled) {
+        // 插件关闭时不读取、不解析、不改写任何AI回复，也不生成缺失/格式错误提示。
+        pendingRun = null;
+        strictBusy = false;
+        clearRuntimePrompts();
+        return;
+    }
+
+    const context = ctx();
+    if (!context?.chat?.length) return;
+
+    const messageId = resolveMessageId(data);
+    const message = context.chat[messageId];
+    if (!message || message.is_user || message.is_system) return;
+
+    const run = pendingRun;
+    const questions = run?.questions || getActiveQuestions();
+    const mode = run?.mode || 'single';
+    const rawText = message.mes || '';
+    let parsed;
+    let latest;
+
+    if (mode === 'strict' && run?.strictCheck) {
+        const mainParsed = parseModelOutput(rawText, []);
+        const body = mainParsed.status === 'missing' ? String(rawText ?? '').trim() : mainParsed.body;
+        updateMessageText(message, body);
+
+        const checkParsed = run.strictParsed || parseModelOutput(run.strictCheck, questions);
+        const strictStatus = checkParsed.status === 'ok' ? 'strict_ok' : 'format_error';
+        latest = makeLatestResult({
+            parsed: checkParsed,
+            questions,
+            mode,
+            messageId,
+            strictRaw: checkParsed.rawCheck || run.strictCheck,
+            strictStatus,
+        });
+        if (mainParsed.status !== 'missing') {
+            latest.formatIssues.push('第二阶段意外重复输出了自检内容，插件已自动移除。');
+            if (latest.status === 'strict_ok') latest.status = 'format_error';
+        }
+    } else {
+        parsed = parseModelOutput(rawText, questions);
+        updateMessageText(message, parsed.body);
+        latest = makeLatestResult({ parsed, questions, mode: 'single', messageId });
+    }
+
+    refreshMessageDom(messageId, message);
+    await saveLatestResult(latest);
+
+    try {
+        await context.saveChat?.();
+    } catch (error) {
+        console.warn('[STSC] 保存已剥离自检的正文失败：', error);
+    }
+
+    pendingRun = null;
+    clearRuntimePrompts();
+    renderAll();
+}
+
+function removeLegacyMessageBadges() {
+    // v0.2.4：格式错误只在悬浮按钮上提示，不再往正文楼层插入任何标记。
+    $('.stscdev-message-badge').remove();
+}
+
+function onGenerationEnded() {
+    clearRuntimePrompts();
+    // 极端情况下没有收到最终消息事件，避免运行状态永久残留。
+    setTimeout(() => {
+        if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
+            pendingRun = null;
+        }
+    }, 5000);
+}
+
+function onGenerationStopped() {
+    clearRuntimePrompts();
+    pendingRun = null;
+    strictBusy = false;
+}
+
+function isOfficialPluginEnabled() {
+    const official = ctx()?.extensionSettings?.sillytavern_self_check;
+    return Boolean(official?.enabled);
+}
+
+function skipGenerationType(type) {
+    const value = String(type || '').toLowerCase();
+    return value === 'quiet' || value === 'dryrun' || value === 'dry_run';
+}
+
+globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextSize, abort, type) {
+    if (isOfficialPluginEnabled()) {
+        if (!officialConflictWarned) {
+            officialConflictWarned = true;
+            toastr.warning('检测到正式版仍处于启用状态。DEV 测试版本轮不会介入生成；测试前请先关闭正式版插件。', '墨提斯之镜 DEV');
+        }
+        return;
+    }
+    officialConflictWarned = false;
+    const settings = normalizeSettings();
+    if (!settings?.enabled || skipGenerationType(type)) return;
+
+    const context = ctx();
+    const questions = getActiveQuestions(settings);
+    const references = getActiveReferences(settings);
+    const temporaryInstructions = getSelectedTemporaryInstructions({ consume: true });
+
+    clearRuntimePrompts();
+    applyReferencePrompts(references);
+    applyTemporaryPrompt(temporaryInstructions, settings.injection);
+
+    if (!questions.length) {
+        pendingRun = null;
+        return;
+    }
+
+    const lastMessageId = Math.max(0, (context.chat?.length || 1) - 1);
+    const lastMessage = context.chat?.[lastMessageId];
+    // 普通发送时，AI消息会出现在当前用户消息之后；重生成/续写时则复用最后一条AI消息。
+    const targetMessageFloor = lastMessage && !lastMessage.is_user && !lastMessage.is_system
+        ? lastMessageId
+        : (context.chat?.length || 0);
+
+    pendingRun = {
+        mode: settings.mode,
+        questions: clone(questions),
+        startedAt: Date.now(),
+        generationType: type,
+        strictCheck: '',
+        strictParsed: null,
+        targetMessageFloor,
+    };
+
+    if (settings.mode === 'strict') {
+        if (strictBusy) return;
+        strictBusy = true;
+        try {
+            const prompt = buildStrictCheckPrompt(questions);
+            internalQuietActive = true;
+            const raw = await context.generateQuietPrompt({ quietPrompt: prompt });
+            internalQuietActive = false;
+            const strictCheck = String(raw || '').trim();
+            if (!strictCheck) {
+                abort?.(true);
+                pendingRun = null;
+                toastr.error('第一阶段没有得到自检结果，已取消正文生成。', '墨提斯之镜 DEV');
+                return;
+            }
+            const strictParsed = parseModelOutput(strictCheck, questions);
+            pendingRun.strictCheck = strictCheck;
+            pendingRun.strictParsed = strictParsed;
+
+            // The internal quiet generation emits its own generation-ended event,
+            // so restore all prompts needed by the real second-stage generation.
+            clearRuntimePrompts();
+            applyReferencePrompts(references);
+            applyTemporaryPrompt(temporaryInstructions, settings.injection);
+            setRuntimePrompt('stscdev_main', buildStrictMainPrompt(questions, strictParsed.rawCheck || strictCheck), settings.injection);
+        } catch (error) {
+            internalQuietActive = false;
+            console.error('[STSC] 双阶段第一阶段失败：', error);
+            abort?.(true);
+            pendingRun = null;
+            toastr.error('双阶段自检调用失败，已取消正文生成。', '墨提斯之镜 DEV');
+        } finally {
+            strictBusy = false;
+        }
+    } else {
+        setRuntimePrompt('stscdev_main', buildSinglePrompt(questions), settings.injection);
+    }
+};
+
+function activeSummary(settings = getUiSettings()) {
+    const entity = getCurrentEntity();
+    const general = settings.generalEnabled ? getPresetById(settings.generalPresetId, settings) : null;
+    const character = settings.characterEnabled ? getBoundPreset(settings) : null;
+    const questions = getActiveQuestions(settings);
+    const refs = getActiveReferences(settings);
+    const temps = getSelectedTemporaryInstructions({ settings });
+
+    const parts = [];
+    if (general?.enabled) parts.push(`通用：${general.name}`);
+    if (character?.enabled && character.id !== general?.id) parts.push(`角色：${character.name}`);
+    if (!parts.length) parts.push('未启用问题预设');
+
+    return {
+        entity,
+        questions,
+        refs,
+        temps,
+        presetText: parts.join(' ＋ '),
+    };
+}
+
+function renderCompact() {
+    const settings = getUiSettings();
+    if (!settings) return;
+    const summary = activeSummary();
+    const latest = getLatestResult();
+
+    $('#stscdev_enabled').prop('checked', settings.enabled);
+    $('#stscdev_mode_quick').val(settings.mode);
+    $('#stscdev_compact_summary').html(
+        `<b>${escapeHtml(summary.entity.name)}</b><br>` +
+        `${escapeHtml(summary.presetText)}<br>` +
+        `本轮共 ${summary.questions.length} 个自检问题，${summary.refs.length} 份参考资料。`
+    );
+
+    if (latest) {
+        $('#stscdev_compact_status').html(
+            `<span class="${statusClass(latest.status)}"><b>${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</b></span>` +
+            `<br><span class="stscdev-muted">${new Date(latest.timestamp).toLocaleString()}</span>`
+        );
+    } else {
+        $('#stscdev_compact_status').html('<span class="stscdev-muted">还没有自检记录。</span>');
+    }
+}
+
+function renderManagerSubtitle() {
+    const summary = activeSummary();
+    $('#stscdev_manager_subtitle').text(`${summary.entity.name}｜${summary.presetText}｜${summary.questions.length}题`);
+}
+
+function renderAnswerCard(answer, index) {
+    const number = index + 1;
+    const evidence = answer.evidence || '';
+    const evidenceHtml = (answer.requireEvidence || evidence)
+        ? `<div class="stscdev-evidence-text"><span class="stscdev-qa-label">A${number}依据：</span>${escapeHtml(evidence || '（未识别到依据）')}</div>`
+        : '';
+    const sourceHtml = answer.source
+        ? `<div class="stscdev-answer-source">问题来源：${escapeHtml(answer.source)}</div>`
+        : '';
+    return `
+        <div class="stscdev-answer-card">
+            <div class="stscdev-question-text"><span class="stscdev-qa-label">Q${number}：</span>${escapeHtml(answer.question || '')}</div>
+            <div class="stscdev-answer-text"><span class="stscdev-qa-label">A${number}：</span>${escapeHtml(answer.answer || '（未识别到回答）')}</div>
+            ${evidenceHtml}
+            ${sourceHtml}
+        </div>`;
+}
+
+function renderStatusTab() {
+    const settings = getUiSettings();
+    const summary = activeSummary(settings);
+    const latest = getLatestResult();
+    const questionList = summary.questions.length
+        ? summary.questions.map((q, i) => `<div class="stscdev-question-card"><div class="stscdev-card-title">${i + 1}. ${escapeHtml(q.text)}</div><div class="stscdev-muted">${escapeHtml(q.source || '')}｜${q.type === 'boolean' ? '判断题' : '开放问答'}｜${q.length === 'brief' ? '简短' : q.length === 'detailed' ? '详细' : '标准'}${q.requireEvidence ? '｜需要依据' : ''}</div></div>`).join('')
+        : '<div class="stscdev-empty">当前没有生效的自检问题。</div>';
+
+    let latestHtml = '<div class="stscdev-empty">还没有自检记录。</div>';
+    if (latest) {
+        const answers = (latest.answers || []).length
+            ? latest.answers.map((answer, i) => renderAnswerCard(answer, i)).join('')
+            : `<div class="stscdev-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
+
+        const issues = (latest.formatIssues || []).length
+            ? `<div class="stscdev-section"><div class="stscdev-section-title stscdev-status-warning">格式提示</div>${latest.formatIssues.map(x => `<div>• ${escapeHtml(x)}</div>`).join('')}</div>`
+            : '';
+
+        latestHtml = `
+            <div class="stscdev-meta-row">
+                <span class="stscdev-status-pill ${statusClass(latest.status)}">${statusIcon(latest.status)} ${escapeHtml(statusText(latest.status))}</span>
+                <span class="stscdev-status-pill">${latest.mode === 'strict' ? '双阶段严格模式' : '单次模式'}</span>
+                <span class="stscdev-status-pill">${latest.answeredCount}/${latest.expectedCount} 题</span>
+                <span class="stscdev-status-pill">${new Date(latest.timestamp).toLocaleString()}</span>
+            </div>
+            ${issues}
+            ${answers}
+        `;
+    }
+
+    const tempPills = summary.temps.length
+        ? `<div class="stscdev-selected-instructions">${summary.temps.map(instruction => `<span class="stscdev-temp-pill">${escapeHtml(instruction.name)}｜${escapeHtml(instructionActivationLabel(instruction.activation))}</span>`).join('')}</div>`
+        : '<div class="stscdev-muted">当前没有启用快捷指令。</div>';
+
+    $('#stscdev_tab_status').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">当前生效内容</div>
+            <div><b>角色：</b>${escapeHtml(summary.entity.name)}</div>
+            <div><b>预设：</b>${escapeHtml(summary.presetText)}</div>
+            <div><b>参考资料：</b>${summary.refs.length ? summary.refs.map(x => escapeHtml(x.name)).join('、') : '无'}</div>
+            <div><b>模式：</b>${settings.mode === 'strict' ? '双阶段严格模式（两次调用）' : '单次模式（一次调用）'}</div>
+            <div class="stscdev-section-title" style="margin-top:12px">当前启用的快捷指令</div>
+            ${tempPills}
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">本轮实际生效问题（${summary.questions.length}）</div>
+            ${questionList}
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">最新一轮自检</div>
+            ${latestHtml}
+        </div>
+    `);
+}
+
+function presetOptions(kind, selectedId, settings = getUiSettings()) {
+    return settings.presets
+        .filter(preset => preset.kind === kind)
+        .map(preset => `<option value="${escapeHtml(preset.id)}" ${preset.id === selectedId ? 'selected' : ''}>${escapeHtml(preset.name)}</option>`)
+        .join('');
+}
+
+function getEditingPreset(kind = null, settings = getUiSettings()) {
+    const actualKind = kind || settings.ui.presetSection || 'general';
+    const id = actualKind === 'character' ? settings.ui.editingCharacterPresetId : settings.ui.editingGeneralPresetId;
+    return settings.presets.find(x => x.id === id && x.kind === actualKind) || null;
+}
+
+function renderQuestionCards(preset) {
+    if (!preset?.questions.length) return '<div class="stscdev-empty">这个预设还没有问题。</div>';
+    return preset.questions.map((question, index) => {
+        const expanded = expandedQuestionIds.has(question.id);
+        const preview = String(question.text || '').trim() || '未填写问题内容';
+        return `
+        <div class="stscdev-question-card stscdev-collapsible-card ${expanded ? 'is-expanded' : 'is-collapsed'}" data-question-id="${escapeHtml(question.id)}">
+            <div class="stscdev-question-summary stscdev-collapsible-summary">
+                <button class="stscdev-collapse-button" type="button" data-action="toggle-question-collapse" aria-expanded="${expanded ? 'true' : 'false'}">
+                    <span class="stscdev-collapse-chevron" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+                    <span class="stscdev-question-summary-text"><b>Q${index + 1}</b><span>${escapeHtml(preview)}</span></span>
+                </button>
+                <label class="checkbox_label stscdev-summary-enable">
+                    <input type="checkbox" data-question-field="enabled" ${question.enabled ? 'checked' : ''}>
+                    <span>${question.enabled ? '已启用' : '未启用'}</span>
+                </label>
+            </div>
+            <div class="stscdev-question-body stscdev-collapsible-body">
+                <div class="stscdev-field">
+                    <label>问题内容</label>
+                    <textarea class="text_pole stscdev-textarea" data-question-field="text">${escapeHtml(question.text)}</textarea>
+                </div>
+                <div class="stscdev-grid-3" style="margin-top:9px">
+                    <div class="stscdev-field">
+                        <label>问题类型</label>
+                        <select class="text_pole" data-question-field="type">
+                            <option value="open" ${question.type === 'open' ? 'selected' : ''}>开放问答题</option>
+                            <option value="boolean" ${question.type === 'boolean' ? 'selected' : ''}>判断题（是/否）</option>
+                        </select>
+                    </div>
+                    <div class="stscdev-field">
+                        <label>回答程度</label>
+                        <select class="text_pole" data-question-field="length">
+                            <option value="brief" ${question.length === 'brief' ? 'selected' : ''}>简短</option>
+                            <option value="standard" ${question.length === 'standard' ? 'selected' : ''}>标准</option>
+                            <option value="detailed" ${question.length === 'detailed' ? 'selected' : ''}>详细</option>
+                        </select>
+                    </div>
+                    <div class="stscdev-field">
+                        <label>回答要求</label>
+                        <label class="checkbox_label"><input type="checkbox" data-question-field="requireEvidence" ${question.requireEvidence ? 'checked' : ''}> 要求剧情/设定依据</label>
+                    </div>
+                </div>
+                <div class="stscdev-card-actions stscdev-collapsible-actions">
+                    <button class="menu_button stscdev-small-button stscdev-icon-action" type="button" data-action="move-question-up" title="上移" aria-label="上移" ${index === 0 ? 'disabled' : ''}><i class="fa-solid fa-arrow-up"></i><span class="stscdev-action-label">上移</span></button>
+                    <button class="menu_button stscdev-small-button stscdev-icon-action" type="button" data-action="move-question-down" title="下移" aria-label="下移" ${index === preset.questions.length - 1 ? 'disabled' : ''}><i class="fa-solid fa-arrow-down"></i><span class="stscdev-action-label">下移</span></button>
+                    <button class="menu_button stscdev-small-button stscdev-danger-button stscdev-icon-action" type="button" data-action="delete-question" title="删除问题" aria-label="删除问题"><i class="fa-solid fa-trash-can"></i><span class="stscdev-action-label">删除</span></button>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function renderPresetsTab() {
+    const settings = getUiSettings();
+    const kind = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    const presets = settings.presets.filter(x => x.kind === kind);
+    let preset = getEditingPreset(kind);
+    if (!preset && presets.length) {
+        preset = presets[0];
+        if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+        else settings.ui.editingGeneralPresetId = preset.id;
+    }
+
+    const currentCharacter = getCurrentCharacterEntity();
+    const binding = getPresetBindingState(preset);
+    const activeGeneral = getPresetById(settings.generalPresetId, settings);
+    const pageTitle = kind === 'general' ? '通用预设' : '角色预设';
+    const selectId = kind === 'general' ? 'stscdev_general_preset_select' : 'stscdev_character_preset_select';
+    const questionsHtml = renderQuestionCards(preset);
+
+    let presetDetails = '<div class="stscdev-empty">还没有预设。请点击“新建预设”。</div>';
+    if (preset) {
+        const generalBox = kind === 'general' ? `
+            <div class="stscdev-binding-box">
+                当前正在生效的通用预设：<b>${escapeHtml(activeGeneral?.name || '无')}</b>
+            </div>
+            <div class="stscdev-toolbar">
+                <button class="menu_button" type="button" data-action="set-general-preset" ${settings.generalPresetId === preset.id ? 'disabled' : ''}>${settings.generalPresetId === preset.id ? '当前通用预设' : '设为当前通用预设'}</button>
+                <button class="menu_button" type="button" data-action="test-preset">测试当前实际生效问题（调用一次API）</button>
+            </div>` : `
+            <div class="stscdev-binding-box ${binding.status === 'missing' ? 'stscdev-binding-missing' : ''}">
+                当前绑定角色卡：<b>${binding.status === 'unbound' ? '未绑定' : escapeHtml(binding.name)}</b>
+                ${binding.status === 'missing' ? '<div class="stscdev-status-error">⚠ 角色卡丢失：原角色卡可能已被删除或更换。</div>' : ''}
+                <div class="stscdev-muted" style="margin-top:5px">当前聊天页面：${currentCharacter.key ? escapeHtml(currentCharacter.name) : '未找到角色卡'}</div>
+            </div>
+            <div class="stscdev-toolbar">
+                <button class="menu_button" type="button" data-action="bind-current-character">绑定到当前角色</button>
+                <button class="menu_button" type="button" data-action="unbind-preset" ${binding.status === 'unbound' ? 'disabled' : ''}>解除绑定</button>
+                <button class="menu_button" type="button" data-action="test-preset">测试当前实际生效问题（调用一次API）</button>
+            </div>`;
+
+        presetDetails = `
+            <div class="stscdev-grid-2" style="margin-top:10px">
+                <div class="stscdev-field"><label>预设名称</label><input id="stscdev_preset_name" class="text_pole" type="text" value="${escapeHtml(preset.name)}"></div>
+                <div class="stscdev-field"><label>预设状态</label><label class="checkbox_label"><input id="stscdev_preset_enabled" type="checkbox" ${preset.enabled ? 'checked' : ''}> 启用该预设</label></div>
+            </div>
+            ${generalBox}`;
+    }
+
+    $('#stscdev_tab_presets').html(`
+        <div class="stscdev-preset-subtabs" role="tablist" aria-label="预设类型">
+            <button type="button" class="stscdev-preset-subtab ${kind === 'general' ? 'active' : ''}" data-preset-section="general">通用预设</button>
+            <button type="button" class="stscdev-preset-subtab ${kind === 'character' ? 'active' : ''}" data-preset-section="character">角色预设</button>
+        </div>
+
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">${pageTitle}</div>
+            <div class="stscdev-muted">${kind === 'general' ? '通用预设可在所有角色中持续生效；可以创建多套，但同一时间只选择一套作为当前通用预设。' : '角色预设创建后默认不绑定。打开角色卡聊天页面后，再手动绑定到当前角色。'}</div>
+            <div class="stscdev-preset-controls" style="margin-top:10px">
+                ${presets.length ? `<select id="${selectId}" class="text_pole stscdev-preset-select">${presetOptions(kind, preset?.id, settings)}</select>` : '<div></div>'}
+                <div class="stscdev-preset-action-toolbar" role="toolbar" aria-label="预设操作">
+                    <button class="menu_button stscdev-compact-action" type="button" data-action="open-create-preset" data-kind="${kind}" title="新建预设" aria-label="新建预设"><i class="fa-solid fa-plus"></i><span class="stscdev-action-label">新建预设</span></button>
+                    <button class="menu_button stscdev-compact-action" type="button" data-action="copy-preset" title="复制预设" aria-label="复制预设" ${preset ? '' : 'disabled'}><i class="fa-solid fa-copy"></i><span class="stscdev-action-label">复制</span></button>
+                    <button class="menu_button stscdev-compact-action" type="button" data-action="export-preset" title="导出当前预设" aria-label="导出当前预设" ${preset ? '' : 'disabled'}><i class="fa-solid fa-file-export"></i><span class="stscdev-action-label">导出</span></button>
+                    <button class="menu_button stscdev-compact-action" type="button" data-action="import-preset" title="导入预设" aria-label="导入预设"><i class="fa-solid fa-file-import"></i><span class="stscdev-action-label">导入</span></button>
+                    <button class="menu_button stscdev-danger-button stscdev-compact-action" type="button" data-action="delete-preset" title="删除预设" aria-label="删除预设" ${preset ? '' : 'disabled'}><i class="fa-solid fa-trash-can"></i><span class="stscdev-action-label">删除</span></button>
+                </div>
+                <input id="stscdev_preset_import_file" class="stscdev-file-input" type="file" accept=".json,.stscdev-preset.json,application/json" aria-label="选择要导入的自检预设文件">
+            </div>
+            <div class="stscdev-muted" style="margin-top:8px">导出文件只包含预设名称、类型和问题设置，不包含角色绑定、聊天记录或自检结果。导入内容会先作为未保存更改加入插件。</div>
+            ${presetDetails}
+        </div>
+
+        ${preset ? `
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">问题列表</div>
+            <div class="stscdev-toolbar">
+                <button class="menu_button" type="button" data-action="add-question">＋ 添加问题</button>
+                <button class="menu_button" type="button" data-action="open-batch-import">批量导入问题</button>
+            </div>
+            <div id="stscdev_question_list">${questionsHtml}</div>
+        </div>` : ''}
+
+        ${lastTestResult ? `
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">最近一次测试结果</div>
+            <div class="stscdev-test-result">${escapeHtml(lastTestResult)}</div>
+        </div>` : ''}
+    `);
+}
+
+function renderReferencesTab() {
+    const settings = getUiSettings();
+    const entity = getCurrentEntity();
+    const references = settings.references.length
+        ? settings.references.map(reference => {
+            const expanded = expandedReferenceIds.has(reference.id);
+            const config = referenceTypeConfig(reference.type);
+            const questionDisabled = !reference.enabled;
+            const scopeText = reference.scope === 'character'
+                ? `角色专属${reference.characterKey ? '（已绑定）' : '（未绑定）'}`
+                : '通用生效';
+
+            return `
+            <div class="stscdev-reference-card ${expanded ? 'is-expanded' : 'is-collapsed'}" data-reference-id="${escapeHtml(reference.id)}">
+                <div class="stscdev-reference-summary">
+                    <button class="stscdev-reference-collapse-button" type="button" data-action="toggle-reference-collapse" aria-expanded="${expanded ? 'true' : 'false'}">
+                        <span class="stscdev-reference-chevron" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+                        <span class="stscdev-reference-summary-name">${escapeHtml(reference.name)}</span>
+                    </button>
+                    <label class="checkbox_label stscdev-reference-enable">
+                        <input type="checkbox" data-reference-field="enabled" ${reference.enabled ? 'checked' : ''}>
+                        <span>${reference.enabled ? '已启用' : '未启用'}</span>
+                    </label>
+                </div>
+
+                <div class="stscdev-reference-body">
+                    <div class="stscdev-grid-2">
+                        <div class="stscdev-field">
+                            <label>资料库名称</label>
+                            <input class="text_pole" data-reference-field="name" type="text" maxlength="80" value="${escapeHtml(reference.name)}">
+                            <div class="stscdev-dialog-error" data-reference-name-error></div>
+                        </div>
+                        <div class="stscdev-field">
+                            <label>资料类型</label>
+                            <select class="text_pole" data-reference-field="type">
+                                <option value="style" ${reference.type === 'style' ? 'selected' : ''}>文风</option>
+                                <option value="restriction" ${reference.type === 'restriction' ? 'selected' : ''}>限制</option>
+                                <option value="other" ${reference.type === 'other' ? 'selected' : ''}>其他</option>
+                            </select>
+                            <div class="stscdev-muted">${escapeHtml(referencePositionHint(reference))}</div>
+                        </div>
+                    </div>
+
+                    <div class="stscdev-field" style="margin-top:9px">
+                        <label>${config.label}内容</label>
+                        <textarea class="text_pole stscdev-textarea" data-reference-field="content" placeholder="在这里填写要注入给 AI 的完整资料内容">${escapeHtml(reference.content)}</textarea>
+                    </div>
+
+                    <div class="stscdev-grid-2" style="margin-top:9px">
+                        <div class="stscdev-field">
+                            <label>生效范围</label>
+                            <select class="text_pole" data-reference-field="scope">
+                                <option value="global" ${reference.scope === 'global' ? 'selected' : ''}>通用生效</option>
+                                <option value="character" ${reference.scope === 'character' ? 'selected' : ''}>角色专属</option>
+                            </select>
+                            <div class="stscdev-muted">当前：${escapeHtml(scopeText)}</div>
+                        </div>
+                        <div class="stscdev-field">
+                            <label>角色绑定</label>
+                            <button class="menu_button" type="button" data-action="bind-reference-character">绑定到 ${escapeHtml(entity.name)}</button>
+                            ${reference.characterKey ? `<div class="stscdev-muted">已保存角色绑定；切换为“通用生效”时不会删除绑定记录。</div>` : '<div class="stscdev-muted">角色专属资料需要先进入对应角色聊天并完成绑定。</div>'}
+                        </div>
+                    </div>
+
+                    <div class="stscdev-section stscdev-reference-injection-section">
+                        <div class="stscdev-section-title">注入设置</div>
+                        <div class="stscdev-muted">创建时已按“${config.label}”自动选择推荐位置，仍可手动调整。</div>
+                        <div class="stscdev-grid-3" style="margin-top:9px">
+                            <div class="stscdev-field">
+                                <label>注入位置</label>
+                                <select class="text_pole" data-reference-field="position">
+                                    <option value="before" ${reference.position === 'before' ? 'selected' : ''}>系统最前</option>
+                                    <option value="prompt" ${reference.position === 'prompt' ? 'selected' : ''}>主提示词内</option>
+                                    <option value="chat" ${reference.position === 'chat' ? 'selected' : ''}>聊天深度</option>
+                                </select>
+                            </div>
+                            <div class="stscdev-field">
+                                <label>深度（0～20）</label>
+                                <input class="text_pole" data-reference-field="depth" type="number" min="0" max="20" value="${reference.depth}">
+                            </div>
+                            <div class="stscdev-field">
+                                <label>角色</label>
+                                <select class="text_pole" data-reference-field="role">
+                                    <option value="system" ${reference.role === 'system' ? 'selected' : ''}>System</option>
+                                    <option value="user" ${reference.role === 'user' ? 'selected' : ''}>User</option>
+                                    <option value="assistant" ${reference.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="stscdev-reference-question-section ${questionDisabled ? 'is-disabled' : ''}">
+                        <label class="checkbox_label">
+                            <input type="checkbox" data-reference-field="addToCheck" ${reference.addToCheck ? 'checked' : ''} ${questionDisabled ? 'disabled' : ''}>
+                            自动加入自检问答末尾
+                        </label>
+                        <div class="stscdev-muted">${questionDisabled ? '请先启用这个资料库，才能启用对应的自检问题。' : '启用后，AI 会先看到资料内容，再回答下面的自检问题。'}</div>
+                        <div class="stscdev-field" style="margin-top:8px">
+                            <label>自动生成的自检问题（可修改）</label>
+                            <textarea class="text_pole" data-reference-field="autoQuestion">${escapeHtml(reference.autoQuestion)}</textarea>
+                            <div class="stscdev-muted">可使用 {{name}} 代表资料库名称。该问题固定要求提供依据。</div>
+                        </div>
+                    </div>
+
+                    <div class="stscdev-button-row stscdev-reference-danger-row">
+                        <button class="menu_button stscdev-compact-action" type="button" data-action="export-reference" title="导出这个资料库" aria-label="导出这个资料库"><i class="fa-solid fa-file-export"></i><span class="stscdev-action-label">导出资料库</span></button>
+                        <button class="menu_button stscdev-danger-button stscdev-compact-action" type="button" data-action="delete-reference" title="删除这个资料库" aria-label="删除这个资料库"><i class="fa-solid fa-trash-can"></i><span class="stscdev-action-label">删除资料库</span></button>
+                    </div>
+                </div>
+            </div>`;
+        }).join('')
+        : '<div class="stscdev-empty">资料库还是空的。</div>';
+
+    $('#stscdev_tab_references').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">参考资料库</div>
+            <div class="stscdev-muted">像世界书一样保存文风、强制限制或其他长期资料。所有资料默认折叠；只有启用资料库后，才能开启它对应的自检问题。</div>
+            <div class="stscdev-toolbar stscdev-reference-action-toolbar" style="margin-top:9px">
+                <button class="menu_button stscdev-compact-action" type="button" data-action="open-create-reference" title="新建资料库" aria-label="新建资料库"><i class="fa-solid fa-plus"></i><span class="stscdev-action-label">新建资料库</span></button>
+                <button class="menu_button stscdev-compact-action" type="button" data-action="batch-export-references" title="批量导出资料库" aria-label="批量导出资料库" ${settings.references.length ? '' : 'disabled'}><i class="fa-solid fa-box-archive"></i><span class="stscdev-action-label">批量导出</span></button>
+                <button class="menu_button stscdev-compact-action" type="button" data-action="import-reference" title="导入资料库或资料库合集" aria-label="导入资料库或资料库合集"><i class="fa-solid fa-file-import"></i><span class="stscdev-action-label">导入资料库</span></button>
+                <input id="stscdev_reference_import_file" class="stscdev-file-input" type="file" accept=".json,.stscdev-reference.json,.stscdev-references.json,application/json" aria-label="选择要导入的参考资料库文件或合集文件">
+            </div>
+            <div class="stscdev-muted" style="margin-top:8px">支持导入单个资料库或一次导入整个资料库合集。导入内容默认保持关闭，角色绑定不会随文件导入；请展开检查后再手动启用。</div>
+            <div class="stscdev-reference-list">${references}</div>
+        </div>
+    `);
+}
+function renderTemporaryTab() {
+    const settings = getUiSettings();
+    const instructions = settings.temporaryInstructions.length
+        ? settings.temporaryInstructions.map(instruction => {
+            const expanded = expandedInstructionIds.has(instruction.id);
+            const mode = instructionActivationMode(instruction.id, settings);
+            const preview = String(instruction.content || '').trim() || '尚未填写指令内容';
+            return `
+            <div class="stscdev-temp-card stscdev-collapsible-card ${expanded ? 'is-expanded' : 'is-collapsed'}" data-temp-id="${escapeHtml(instruction.id)}">
+                <div class="stscdev-temp-summary stscdev-collapsible-summary">
+                    <button class="stscdev-collapse-button" type="button" data-action="toggle-temp-collapse" aria-expanded="${expanded ? 'true' : 'false'}">
+                        <span class="stscdev-collapse-chevron" aria-hidden="true">${expanded ? '▾' : '▸'}</span>
+                        <span class="stscdev-temp-summary-text"><b>${escapeHtml(instruction.name)}</b><span>${escapeHtml(preview)}</span></span>
+                    </button>
+                    <span class="stscdev-status-pill stscdev-instruction-mode-${mode}">${escapeHtml(instructionActivationLabel(mode))}</span>
+                </div>
+                <div class="stscdev-temp-body stscdev-collapsible-body">
+                    <div class="stscdev-field"><label>指令名称</label><input class="text_pole" data-temp-field="name" type="text" value="${escapeHtml(instruction.name)}"></div>
+                    <div class="stscdev-field" style="margin-top:8px"><label>发送给 AI 的指令内容</label><textarea class="text_pole stscdev-textarea" data-temp-field="content">${escapeHtml(instruction.content)}</textarea></div>
+                    <div class="stscdev-muted" style="margin-top:8px">启用方式请在悬浮窗的“快捷指令”页面选择：临时一轮会在下一次生成开始后自动关闭，常开会每轮持续注入。</div>
+                    <div class="stscdev-card-actions stscdev-collapsible-actions">
+                        <button class="menu_button stscdev-small-button stscdev-danger-button stscdev-icon-action" type="button" data-action="delete-temp" title="删除指令" aria-label="删除指令"><i class="fa-solid fa-trash-can"></i><span class="stscdev-action-label">删除指令</span></button>
+                    </div>
+                </div>
+            </div>`;
+        }).join('')
+        : '<div class="stscdev-empty">还没有保存快捷指令。</div>';
+
+    $('#stscdev_tab_temporary').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">快捷指令库</div>
+            <div class="stscdev-muted">在完整管理器中创建和编辑指令；在悬浮窗的“快捷指令”页面选择关闭、临时一轮或常开。所有指令默认折叠，点击横条即可展开。</div>
+            <div class="stscdev-toolbar" style="margin-top:9px">
+                <button class="menu_button" data-action="add-temp">＋ 新建快捷指令</button>
+            </div>
+            <div class="stscdev-instruction-list">${instructions}</div>
+        </div>
+    `);
+}
+
+function renderSettingsTab() {
+    const settings = getUiSettings();
+    $('#stscdev_tab_settings').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">运行方式</div>
+            <label class="checkbox_label"><input id="stscdev_setting_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}> 启用插件</label>
+            <div class="stscdev-grid-2" style="margin-top:10px">
+                <div class="stscdev-field"><label>生成模式</label><select id="stscdev_setting_mode" class="text_pole">
+                    <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单次模式：自检与正文一次生成</option>
+                    <option value="strict" ${settings.mode === 'strict' ? 'selected' : ''}>双阶段严格模式：先自检，再调用一次生成正文</option>
+                </select></div>
+                <div class="stscdev-field"><label>预设叠加</label>
+                    <label class="checkbox_label"><input id="stscdev_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 启用通用预设</label>
+                    <label class="checkbox_label"><input id="stscdev_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 启用角色专属预设</label>
+                </div>
+            </div>
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">自检与快捷指令默认注入位置</div>
+            <div class="stscdev-muted">默认使用“系统最前”，优先级最高；只有熟悉提示词结构时才建议调整。</div>
+            <div class="stscdev-grid-3" style="margin-top:10px">
+                <div class="stscdev-field"><label>位置</label><select id="stscdev_injection_position" class="text_pole">
+                    <option value="before" ${settings.injection.position === 'before' ? 'selected' : ''}>系统最前（默认）</option>
+                    <option value="prompt" ${settings.injection.position === 'prompt' ? 'selected' : ''}>主提示词内</option>
+                    <option value="chat" ${settings.injection.position === 'chat' ? 'selected' : ''}>聊天深度</option>
+                </select></div>
+                <div class="stscdev-field"><label>深度（0～20）</label><input id="stscdev_injection_depth" class="text_pole" type="number" min="0" max="20" value="${settings.injection.depth}"></div>
+                <div class="stscdev-field"><label>角色</label><select id="stscdev_injection_role" class="text_pole">
+                    <option value="system" ${settings.injection.role === 'system' ? 'selected' : ''}>System</option>
+                    <option value="user" ${settings.injection.role === 'user' ? 'selected' : ''}>User</option>
+                    <option value="assistant" ${settings.injection.role === 'assistant' ? 'selected' : ''}>Assistant</option>
+                </select></div>
+            </div>
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">界面显示</div>
+            <div class="stscdev-grid-2">
+                <div class="stscdev-field"><label>插件配色</label><select id="stscdev_theme" class="text_pole">
+                    <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
+                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option>
+                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
+                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option>
+                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option>
+                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
+                </select></div>
+                <div class="stscdev-field"><label>悬浮窗</label>
+                    <label class="checkbox_label"><input id="stscdev_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，查看自检问答并快速启用指令</label>
+                    <div class="stscdev-muted">悬浮按钮支持鼠标或手指拖动，并会记住位置；悬浮窗包含“自检问答”和“快捷指令”两个页面。</div>
+                </div>
+            </div>
+            <div class="stscdev-floating-customizer">
+                <div class="stscdev-field"><label>悬浮窗样式</label><select id="stscdev_floating_style" class="text_pole">
+                    <option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option>
+                    <option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option>
+                    <option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option>
+                    <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
+                </select></div>
+                <div class="stscdev-field stscdev-range-field"><label>悬浮按钮透明度 <span id="stscdev_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stscdev_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"><div class="stscdev-muted">只调整圆形悬浮按钮的背景透明度，不影响打开后的悬浮窗内容。</div></div>
+                <div class="stscdev-field stscdev-range-field"><label>悬浮按钮大小 <span id="stscdev_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stscdev_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"><div class="stscdev-muted">最大为原来的按钮大小，向左可缩小两档以上；图标、红点和拖动范围会同步适配。</div></div>
+                <div class="stscdev-field stscdev-range-field"><label>悬浮窗宽度 <span id="stscdev_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stscdev_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
+                <div class="stscdev-field stscdev-range-field"><label>悬浮窗高度 <span id="stscdev_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stscdev_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
+            </div>
+            <div class="stscdev-muted" style="margin-top:8px">移动端会在安全区域内自动限制最大尺寸；调整设置时，已打开的悬浮窗会即时预览。</div>
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">上下文处理</div>
+            <div>插件不会在流式生成期间添加整段遮罩。建议使用 README 中提供的正则，仅隐藏 &lt;stscdev_self_check&gt; 标签内的自检内容。</div>
+            <div>生成完成后，插件会提取自检并从聊天正文中剥离；聊天记录只保留正文、状态栏和其他正常输出，下一轮AI读取不到上一轮自检。</div>
+            <div class="stscdev-code-note">&lt;stscdev_self_check&gt;…&lt;/stscdev_self_check&gt; → 正则隐藏并由插件保存
+结束标签之后 → 正常流式正文</div>
+        </div>
+    `);
+}
+
+
+function releaseChangesHtml(info) {
+    const changes = Array.isArray(info?.changes) ? info.changes.filter(item => typeof item === 'string' && item.trim()) : [];
+    if (!changes.length) return '<div class="stscdev-muted">暂无详细更新说明。</div>';
+    return `<ul class="stscdev-release-change-list">${changes.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`;
+}
+
+function renderUpdatesTab() {
+    const hasUpdate = updateCheckState === 'available';
+    const remoteVersionLabel = updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0
+        ? `v${escapeHtml(updateAvailableVersion)}`
+        : '远程有新提交';
+    let remoteHtml = '';
+    if (updateCheckState === 'checking') {
+        remoteHtml = '<div class="stscdev-update-state"><i class="fa-solid fa-spinner fa-spin"></i> 正在检查远程版本……</div>';
+    } else if (updateCheckState === 'updating') {
+        remoteHtml = '<div class="stscdev-update-state"><i class="fa-solid fa-spinner fa-spin"></i> 正在拉取并安装新版本，请不要关闭页面……</div>';
+    } else if (hasUpdate) {
+        const remote = latestRemoteReleaseInfo || { version: updateAvailableVersion, changes: [] };
+        remoteHtml = `
+            <div class="stscdev-update-card is-available">
+                <div class="stscdev-update-card-head">
+                    <div><div class="stscdev-update-kicker">发现新版本</div><div class="stscdev-update-version">${remoteVersionLabel}</div></div>
+                    <button class="menu_button stscdev-primary-button" type="button" data-action="update-plugin-now"><i class="fa-solid fa-download"></i> 立即更新</button>
+                </div>
+                ${remote.title ? `<div class="stscdev-release-title">${escapeHtml(remote.title)}</div>` : ''}
+                ${releaseChangesHtml(remote)}
+                <div class="stscdev-muted" style="margin-top:8px">更新完成后页面会自动刷新。更新前请先保存当前未保存的插件设置。</div>
+            </div>`;
+    } else if (updateCheckState === 'error') {
+        remoteHtml = `<div class="stscdev-update-card is-error"><b>暂时无法检查更新</b><div class="stscdev-muted">${escapeHtml(updateCheckError || '网络或扩展更新接口不可用。')}</div></div>`;
+    } else {
+        remoteHtml = '<div class="stscdev-update-card is-latest"><b>当前已经是最新版本。</b><div class="stscdev-muted">插件启动、打开管理器以及后台定时检查时都会自动检测新版本。</div></div>';
+    }
+
+    $('#stscdev_tab_updates').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">当前版本</div>
+            <div class="stscdev-current-version-row">
+                <div><div class="stscdev-update-kicker">已安装</div><div class="stscdev-update-version">v${escapeHtml(STSC_RELEASE_INFO.version)}</div></div>
+                <button class="menu_button" type="button" data-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
+            </div>
+            <div class="stscdev-release-title">${escapeHtml(STSC_RELEASE_INFO.title)}</div>
+            <div class="stscdev-muted">发布日期：${escapeHtml(STSC_RELEASE_INFO.releasedAt)}</div>
+            ${releaseChangesHtml(STSC_RELEASE_INFO)}
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">更新状态</div>
+            ${remoteHtml}
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">更新提醒说明</div>
+            <div>只有远程版本号高于当前版本时，插件才会显示“插件有更新”提示，并在魔法棒菜单入口标记“更新”。</div>
+            <div class="stscdev-muted" style="margin-top:6px">没有新版本时不会弹窗。发现更新后可直接在本页面完成更新，更新说明可随时回来查看。</div>
+        </div>
+    `);
+}
+
+function renderFloatingInstructionPage() {
+    const runtimeSettings = normalizeSettings();
+    const instructions = runtimeSettings.temporaryInstructions;
+    $('#stscdev_floating_title').text('快捷指令');
+    $('#stscdev_floating_subtitle').text('选择临时一轮或常开');
+
+    if (!instructions.length) {
+        $('#stscdev_floating_content').html('<div class="stscdev-empty">还没有保存快捷指令。请先在完整管理器中创建并保存。</div>');
+        return;
+    }
+
+    const html = instructions.map(instruction => {
+        const mode = instructionActivationMode(instruction.id, runtimeSettings);
+        const empty = !String(instruction.content || '').trim();
+        const preview = empty ? '内容为空，请先到完整管理器编辑。' : String(instruction.content).trim();
+        return `
+            <div class="stscdev-floating-instruction-card" data-floating-temp-id="${escapeHtml(instruction.id)}">
+                <div class="stscdev-floating-instruction-head">
+                    <div class="stscdev-floating-instruction-name">${escapeHtml(instruction.name)}</div>
+                    <select class="text_pole stscdev-floating-instruction-mode" data-floating-instruction-mode aria-label="${escapeHtml(instruction.name)}的启用方式" ${empty ? 'disabled' : ''}>
+                        <option value="off" ${mode === 'off' ? 'selected' : ''}>关闭</option>
+                        <option value="once" ${mode === 'once' ? 'selected' : ''}>临时一轮（默认）</option>
+                        <option value="always" ${mode === 'always' ? 'selected' : ''}>常开</option>
+                    </select>
+                </div>
+                <div class="stscdev-floating-instruction-preview ${empty ? 'is-empty' : ''}">${escapeHtml(preview)}</div>
+            </div>`;
+    }).join('');
+    $('#stscdev_floating_content').html(`<div class="stscdev-floating-instruction-list">${html}</div>`);
+}
+
+function renderFloatingBadge() {
+    // 插件关闭期间不显示错误红点，避免历史记录被误认为当前仍在检测。
+    if (!getUiSettings()?.enabled) {
+        $('#stscdev_floating_badge').addClass('stscdev-hidden').text('');
+        return;
+    }
+
+    const latest = getLatestResult();
+    const hasUnreadIssue = latestHasUnreadIssue(latest);
+    $('#stscdev_floating_badge')
+        .toggleClass('stscdev-hidden', !hasUnreadIssue)
+        .text(latest?.status === 'format_error' ? '⚠' : '!');
+}
+
+function renderFloatingCheckPage() {
+    const latest = getLatestResult();
+    $('#stscdev_floating_title').text('最新一轮自检');
+
+    if (!latest) {
+        $('#stscdev_floating_subtitle').text('还没有自检记录');
+        $('#stscdev_floating_content').html('<div class="stscdev-empty">完成一次角色回复后，这里会显示最新一轮自检问答。</div>');
+        return;
+    }
+
+    $('#stscdev_floating_subtitle').text(`${statusText(latest.status)}｜${new Date(latest.timestamp).toLocaleString()}`);
+    const issues = (latest.formatIssues || []).length
+        ? `<div class="stscdev-section"><div class="stscdev-section-title stscdev-status-warning">格式提示</div>${latest.formatIssues.map(x => `<div>• ${escapeHtml(x)}</div>`).join('')}</div>`
+        : '';
+    const answers = (latest.answers || []).length
+        ? latest.answers.map((answer, index) => renderAnswerCard(answer, index)).join('')
+        : `<div class="stscdev-test-result">${escapeHtml(latest.rawCheck || '没有可显示的自检内容。')}</div>`;
+    $('#stscdev_floating_content').html(`${issues}${answers}`);
+}
+
+function renderFloating() {
+    const settings = getUiSettings();
+    const $root = $('#stscdev_floating_root');
+    if (!$root.length) return;
+    applyTheme(settings);
+    applyFloatingAppearance(settings);
+    applyFloatingPosition(settings);
+
+    const enabled = Boolean(settings.appearance?.floatingEnabled);
+    $root.toggleClass('stscdev-hidden', !enabled).attr('aria-hidden', enabled ? 'false' : 'true');
+    if (!enabled) {
+        const panel = document.getElementById('stscdev_floating_panel');
+        panel?.style?.removeProperty('display');
+        $('#stscdev_floating_panel').addClass('stscdev-hidden').attr('aria-hidden', 'true');
+        return;
+    }
+
+    renderFloatingBadge();
+    removeLegacyMessageBadges();
+    $('#stscdev_floating_panel [data-floating-page]').removeClass('active').attr('aria-selected', 'false');
+    $(`#stscdev_floating_panel [data-floating-page="${floatingPanelPage}"]`).addClass('active').attr('aria-selected', 'true');
+
+    if (floatingPanelPage === 'instructions') {
+        renderFloatingInstructionPage();
+    } else {
+        renderFloatingCheckPage();
+    }
+
+    $('#stscdev_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : '打开完整管理器');
+    const panelOpen = !$('#stscdev_floating_panel').hasClass('stscdev-hidden');
+    if (panelOpen) requestAnimationFrame(layoutFloatingPanel);
+    if (panelOpen && floatingPanelPage === 'check') void markLatestIssueViewed();
+}
+
+function renderAll() {
+    if (!initialized) return;
+    removeLegacyMessageBadges();
+    renderCompact();
+    renderManagerSubtitle();
+    renderStatusTab();
+    renderPresetsTab();
+    renderReferencesTab();
+    renderTemporaryTab();
+    renderSettingsTab();
+    renderUpdatesTab();
+    renderFloating();
+    applyTheme(getUiSettings());
+    updateSaveState();
+}
+
+function openManager(tab = null) {
+    void checkForPluginUpdate({ force: true });
+    if (!editDraft) beginEditSession();
+    const settings = getUiSettings();
+    if (tab) settings.ui.activeTab = tab;
+    $('#stscdev_manager_overlay').removeClass('stscdev-hidden').attr('aria-hidden', 'false');
+    $('body').addClass('stscdev-modal-open');
+    performSwitchTab(settings.ui.activeTab || 'status');
+    renderAll();
+    if ((settings.ui.activeTab || 'status') === 'status') void markLatestIssueViewed();
+}
+
+function performCloseManager() {
+    closeDialog();
+    expandedReferenceIds.clear();
+    expandedQuestionIds.clear();
+    expandedInstructionIds.clear();
+    $('#stscdev_manager_overlay').addClass('stscdev-hidden').attr('aria-hidden', 'true');
+    $('body').removeClass('stscdev-modal-open');
+    if (editDraft?.ui) {
+        normalizeSettings().ui = clone(editDraft.ui);
+        saveSettings();
+    }
+    editDraft = null;
+    editDirty = false;
+    applyTheme(normalizeSettings());
+    renderFloating();
+}
+
+function closeManager() {
+    requestUnsavedDecision(performCloseManager);
+}
+
+function openDialog(title, bodyHtml, footerHtml = '') {
+    $('#stscdev_dialog_title').text(title || '操作');
+    $('#stscdev_dialog_body').html(bodyHtml || '');
+    $('#stscdev_dialog_footer').html(footerHtml || '');
+    $('#stscdev_dialog_overlay').removeClass('stscdev-hidden').attr('aria-hidden', 'false');
+    $('body').addClass('stscdev-modal-open');
+}
+
+function closeDialog() {
+    const hadPendingUnsavedAction = Boolean(pendingUnsavedAction);
+    bulkDraft = null;
+    pendingUnsavedAction = null;
+    pendingDeleteRequest = null;
+    $('#stscdev_dialog_overlay').addClass('stscdev-hidden').attr('aria-hidden', 'true');
+    $('#stscdev_dialog_title, #stscdev_dialog_body, #stscdev_dialog_footer').empty();
+    if (hadPendingUnsavedAction && initialized) renderAll();
+}
+
+function openDeleteConfirmation({ title = '确认删除', message = '确定要删除吗？', detail = '', perform }) {
+    pendingDeleteRequest = typeof perform === 'function' ? perform : null;
+    const detailHtml = detail
+        ? `<div class="stscdev-delete-preview">${escapeHtml(detail)}</div>`
+        : '';
+    openDialog(
+        title,
+        `<div class="stscdev-delete-warning"><b>${escapeHtml(message)}</b><div class="stscdev-muted" style="margin-top:7px">删除后仍需点击“保存更改”才会正式保存；在保存前也可以放弃本次修改。</div>${detailHtml}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>' +
+        '<button class="menu_button stscdev-danger-button" type="button" data-dialog-action="confirm-delete">确认删除</button>'
+    );
+}
+
+function performSwitchTab(tab) {
+    const settings = getUiSettings();
+    settings.ui.activeTab = tab;
+    $('.stscdev-tab').removeClass('active');
+    $(`.stscdev-tab[data-tab="${tab}"]`).addClass('active');
+    $('.stscdev-tab-panel').removeClass('active');
+    $(`#stscdev_tab_${tab}`).addClass('active');
+}
+
+function switchTab(tab) {
+    const current = getUiSettings().ui.activeTab || 'status';
+    if (tab === current) return;
+    requestUnsavedDecision(() => {
+        performSwitchTab(tab);
+        renderAll();
+        if (tab === 'status') void markLatestIssueViewed();
+    });
+}
+
+function normalizePresetName(name) {
+    return String(name || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase();
+}
+
+function presetNameExists(name, excludeId = '') {
+    const normalized = normalizePresetName(name);
+    return Boolean(normalized && getUiSettings().presets.some(x => x.id !== excludeId && normalizePresetName(x.name) === normalized));
+}
+
+function makeUniquePresetName(baseName) {
+    const base = String(baseName || '新自检预设').trim() || '新自检预设';
+    if (!presetNameExists(base)) return base;
+    let index = 2;
+    while (presetNameExists(`${base} ${index}`)) index += 1;
+    return `${base} ${index}`;
+}
+
+function referenceNameExists(name, excludeId = '') {
+    const normalized = normalizePresetName(name);
+    return Boolean(normalized && getUiSettings().references.some(reference => reference.id !== excludeId && normalizePresetName(reference.name) === normalized));
+}
+
+function makeUniqueReferenceName(baseName) {
+    const base = String(baseName || '新参考资料').trim() || '新参考资料';
+    if (!referenceNameExists(base)) return base;
+    let index = 2;
+    while (referenceNameExists(`${base} ${index}`)) index += 1;
+    return `${base} ${index}`;
+}
+
+function referenceTypeLabel(type) {
+    return referenceTypeConfig(type).label;
+}
+
+function referencePositionHint(reference) {
+    const config = referenceTypeConfig(reference.type);
+    if (reference.type === 'style') return '文风默认放在主提示词内，作为持续写作风格使用。';
+    if (reference.type === 'restriction') return '限制默认以 System 身份插入聊天深度 0，尽量靠近本轮生成位置以加强注意。';
+    return `其他资料默认使用“${positionLabel(config.position)}”，可按需要手动调整。`;
+}
+
+function presetKindText(kind) {
+    return kind === 'character' ? '角色预设' : '通用预设';
+}
+
+function sanitizeExportFileName(name) {
+    const cleaned = String(name || '自检预设')
+        .replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 80);
+    return cleaned || '自检预设';
+}
+
+function makePresetExportPayload(preset) {
+    return {
+        format: STSC_PRESET_EXPORT_FORMAT,
+        formatVersion: STSC_PRESET_EXPORT_VERSION,
+        pluginVersion: STSC_VERSION,
+        exportedAt: new Date().toISOString(),
+        preset: {
+            name: preset.name,
+            kind: preset.kind,
+            enabled: Boolean(preset.enabled),
+            questions: preset.questions.map(question => ({
+                text: question.text,
+                type: question.type,
+                length: question.length,
+                requireEvidence: Boolean(question.requireEvidence),
+                enabled: Boolean(question.enabled),
+            })),
+        },
+    };
+}
+
+function downloadPresetFile(preset) {
+    if (!preset) {
+        toastr.warning('当前没有可以导出的自检预设。', '墨提斯之镜 DEV');
+        return;
+    }
+
+    const payload = makePresetExportPayload(preset);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${sanitizeExportFileName(preset.name)}.stscdev-preset.json`;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success(`已导出“${preset.name}”。`, '墨提斯之镜 DEV');
+}
+
+function isPlainObject(value) {
+    return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function validateImportedPresetPayload(payload) {
+    if (!isPlainObject(payload)) throw new Error('文件内容不是有效的预设对象。');
+    if (payload.format !== STSC_PRESET_EXPORT_FORMAT) throw new Error('文件不是由墨提斯之镜 DEV 插件导出的预设。');
+    if (payload.formatVersion !== STSC_PRESET_EXPORT_VERSION) throw new Error('该预设文件版本暂不受支持。');
+    if (!isPlainObject(payload.preset)) throw new Error('文件中缺少自检预设内容。');
+
+    const preset = payload.preset;
+    const name = typeof preset.name === 'string' ? preset.name.trim() : '';
+    if (!name || name.length > 80) throw new Error('预设名称为空或长度异常。');
+    if (!['general', 'character'].includes(preset.kind)) throw new Error('预设类型不正确。');
+    if (typeof preset.enabled !== 'boolean') throw new Error('预设启用状态格式不正确。');
+    if (!Array.isArray(preset.questions) || preset.questions.length > 500) throw new Error('问题列表缺失或数量异常。');
+
+    const questions = preset.questions.map((question, index) => {
+        if (!isPlainObject(question)) throw new Error(`第 ${index + 1} 个问题格式不正确。`);
+        const text = typeof question.text === 'string' ? question.text.trim() : '';
+        if (!text || text.length > 10000) throw new Error(`第 ${index + 1} 个问题内容为空或长度异常。`);
+        if (!['open', 'boolean'].includes(question.type)) throw new Error(`第 ${index + 1} 个问题类型不正确。`);
+        if (!['brief', 'standard', 'detailed'].includes(question.length)) throw new Error(`第 ${index + 1} 个问题回答程度不正确。`);
+        if (typeof question.requireEvidence !== 'boolean') throw new Error(`第 ${index + 1} 个问题的依据选项格式不正确。`);
+        if (typeof question.enabled !== 'boolean') throw new Error(`第 ${index + 1} 个问题的启用状态格式不正确。`);
+        return {
+            text,
+            type: question.type,
+            length: question.length,
+            requireEvidence: question.requireEvidence,
+            enabled: question.enabled,
+        };
+    });
+
+    return {
+        name,
+        kind: preset.kind,
+        enabled: preset.enabled,
+        questions,
+    };
+}
+
+async function importPresetFile(file) {
+    if (!file) return;
+    if (file.size > STSC_PRESET_IMPORT_MAX_BYTES) {
+        toastr.error('格式不匹配：文件过大，无法作为自检预设导入。', '墨提斯之镜 DEV');
+        return;
+    }
+
+    try {
+        const text = await file.text();
+        let payload;
+        try {
+            payload = JSON.parse(text.replace(/^\uFEFF/, ''));
+        } catch {
+            throw new Error('文件不是有效的 JSON 预设文件。');
+        }
+
+        const imported = validateImportedPresetPayload(payload);
+        const settings = getUiSettings();
+        const preset = createPreset(makeUniquePresetName(imported.name), imported.kind);
+        preset.enabled = imported.enabled;
+        preset.questions = imported.questions.map(question => ({
+            id: uid('q'),
+            ...question,
+        }));
+        // 分享文件不携带任何人的角色卡绑定；角色预设导入后需要用户自行绑定。
+        preset.boundCharacterKey = '';
+        preset.boundCharacterName = '';
+
+        settings.presets.push(preset);
+        settings.ui.presetSection = preset.kind;
+        if (preset.kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+        else settings.ui.editingGeneralPresetId = preset.id;
+
+        markDirty();
+        renderAll();
+        const renameNote = preset.name === imported.name ? '' : `；因名称重复，已改名为“${preset.name}”`;
+        const bindingNote = preset.kind === 'character' ? '；角色绑定不会随文件导入，请手动绑定当前角色' : '';
+        toastr.success(`已导入${presetKindText(preset.kind)}“${preset.name}”，共 ${preset.questions.length} 个问题${renameNote}${bindingNote}。请点击“保存更改”正式保存。`, '墨提斯之镜 DEV');
+    } catch (error) {
+        console.warn('[STSC] 导入自检预设失败：', error);
+        toastr.error(`格式不匹配，文件错误或不是本插件导出的自检预设。${error?.message ? ` ${error.message}` : ''}`, '墨提斯之镜 DEV', { timeOut: 7000 });
+    }
+}
+
+
+function makeReferenceExportPayload(reference) {
+    return {
+        format: STSC_REFERENCE_EXPORT_FORMAT,
+        formatVersion: STSC_REFERENCE_EXPORT_VERSION,
+        pluginVersion: STSC_VERSION,
+        exportedAt: new Date().toISOString(),
+        reference: {
+            name: reference.name,
+            type: reference.type,
+            content: reference.content,
+            enabled: Boolean(reference.enabled),
+            scope: reference.scope,
+            position: reference.position,
+            depth: reference.depth,
+            role: reference.role,
+            addToCheck: Boolean(reference.addToCheck),
+            autoQuestion: reference.autoQuestion,
+        },
+    };
+}
+
+function downloadReferenceFile(reference) {
+    if (!reference) {
+        toastr.warning('没有找到可以导出的参考资料库。', '墨提斯之镜 DEV');
+        return;
+    }
+
+    const payload = makeReferenceExportPayload(reference);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${sanitizeExportFileName(reference.name)}.stscdev-reference.json`;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success(`已导出资料库“${reference.name}”。`, '墨提斯之镜 DEV');
+}
+
+
+function makeReferenceBundleExportPayload(references) {
+    return {
+        format: STSC_REFERENCE_BUNDLE_EXPORT_FORMAT,
+        formatVersion: STSC_REFERENCE_BUNDLE_EXPORT_VERSION,
+        pluginVersion: STSC_VERSION,
+        exportedAt: new Date().toISOString(),
+        references: references.map(reference => makeReferenceExportPayload(reference).reference),
+    };
+}
+
+function downloadReferenceBundleFile(references) {
+    const selected = Array.isArray(references) ? references.filter(Boolean) : [];
+    if (!selected.length) {
+        toastr.warning('请至少选择一个要导出的资料库。', '墨提斯之镜 DEV');
+        return false;
+    }
+    const payload = makeReferenceBundleExportPayload(selected);
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    const date = new Date().toISOString().slice(0, 10);
+    anchor.href = url;
+    anchor.download = `墨提斯之镜 DEV-资料库合集-${date}.stscdev-references.json`;
+    anchor.style.display = 'none';
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toastr.success(`已将 ${selected.length} 个资料库批量导出为一个合集文件。`, '墨提斯之镜 DEV');
+    return true;
+}
+
+function openBatchReferenceExportDialog() {
+    const references = getUiSettings().references;
+    if (!references.length) {
+        toastr.warning('当前没有可以导出的参考资料库。', '墨提斯之镜 DEV');
+        return;
+    }
+    const items = references.map(reference => `
+        <label class="stscdev-batch-reference-item">
+            <input type="checkbox" data-batch-reference-id="${escapeHtml(reference.id)}" checked>
+            <span class="stscdev-batch-reference-main"><b>${escapeHtml(reference.name)}</b><span>${escapeHtml(referenceTypeLabel(reference.type))}｜${reference.enabled ? '已启用' : '未启用'}｜${reference.scope === 'character' ? '角色专属' : '通用'}</span></span>
+        </label>`).join('');
+    openDialog(
+        '批量导出资料库',
+        `<div class="stscdev-muted">勾选要一起分享的资料库。所有选中内容会被打包为一个文件，接收者导入一次即可全部加入。</div>
+         <div class="stscdev-batch-reference-tools">
+            <button class="menu_button stscdev-small-button" type="button" data-dialog-action="batch-reference-select-all">全选</button>
+            <button class="menu_button stscdev-small-button" type="button" data-dialog-action="batch-reference-select-none">清空</button>
+            <span id="stscdev_batch_reference_count" class="stscdev-muted">已选择 ${references.length} 个</span>
+         </div>
+         <div class="stscdev-batch-reference-list">${items}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>' +
+        '<button class="menu_button stscdev-primary-button" type="button" data-dialog-action="confirm-batch-reference-export">导出所选资料库</button>'
+    );
+}
+
+function validateImportedReferenceRecord(reference) {
+    if (!isPlainObject(reference)) throw new Error('资料库条目不是有效对象。');
+    const name = typeof reference.name === 'string' ? reference.name.trim() : '';
+    if (!name || name.length > 80) throw new Error('资料库名称为空或长度异常。');
+    if (!Object.hasOwn(REFERENCE_TYPE_CONFIG, reference.type)) throw new Error(`资料库“${name}”的资料类型不正确。`);
+    if (typeof reference.content !== 'string' || reference.content.length > 2_000_000) throw new Error(`资料库“${name}”的内容缺失或长度异常。`);
+    if (typeof reference.enabled !== 'boolean') throw new Error(`资料库“${name}”的启用状态格式不正确。`);
+    if (!['global', 'character'].includes(reference.scope)) throw new Error(`资料库“${name}”的生效范围不正确。`);
+    if (!['before', 'prompt', 'chat'].includes(reference.position)) throw new Error(`资料库“${name}”的注入位置不正确。`);
+    if (!Number.isInteger(reference.depth) || reference.depth < 0 || reference.depth > 20) throw new Error(`资料库“${name}”的注入深度不正确。`);
+    if (!['system', 'user', 'assistant'].includes(reference.role)) throw new Error(`资料库“${name}”的注入角色不正确。`);
+    if (typeof reference.addToCheck !== 'boolean') throw new Error(`资料库“${name}”的自动问题状态格式不正确。`);
+    if (typeof reference.autoQuestion !== 'string' || reference.autoQuestion.length > 10000) throw new Error(`资料库“${name}”的自动问题格式不正确。`);
+    return {
+        name,
+        type: reference.type,
+        content: reference.content,
+        scope: reference.scope,
+        position: reference.position,
+        depth: reference.depth,
+        role: reference.role,
+        addToCheck: reference.addToCheck,
+        autoQuestion: reference.autoQuestion,
+    };
+}
+
+function validateImportedReferencePayload(payload) {
+    if (!isPlainObject(payload)) throw new Error('文件内容不是有效的资料库对象。');
+
+    if (payload.format === STSC_REFERENCE_EXPORT_FORMAT) {
+        if (payload.formatVersion !== STSC_REFERENCE_EXPORT_VERSION) throw new Error('该资料库文件版本暂不受支持。');
+        if (!isPlainObject(payload.reference)) throw new Error('文件中缺少参考资料库内容。');
+        return { isBundle: false, references: [validateImportedReferenceRecord(payload.reference)] };
+    }
+
+    if (payload.format === STSC_REFERENCE_BUNDLE_EXPORT_FORMAT) {
+        if (payload.formatVersion !== STSC_REFERENCE_BUNDLE_EXPORT_VERSION) throw new Error('该资料库合集文件版本暂不受支持。');
+        if (!Array.isArray(payload.references) || !payload.references.length) throw new Error('资料库合集为空。');
+        if (payload.references.length > 500) throw new Error('资料库合集条目过多。');
+        return { isBundle: true, references: payload.references.map(validateImportedReferenceRecord) };
+    }
+
+    throw new Error('文件不是由墨提斯之镜 DEV 插件导出的资料库或资料库合集。');
+}
+
+async function importReferenceFile(file) {
+    if (!file) return;
+    if (file.size > STSC_REFERENCE_IMPORT_MAX_BYTES) {
+        toastr.error('格式不匹配：文件过大，无法作为参考资料库或资料库合集导入。', '墨提斯之镜 DEV');
+        return;
+    }
+
+    try {
+        const text = await file.text();
+        let payload;
+        try {
+            payload = JSON.parse(text.replace(/^\uFEFF/, ''));
+        } catch {
+            throw new Error('文件不是有效的 JSON 资料库文件。');
+        }
+
+        const importedPayload = validateImportedReferencePayload(payload);
+        const settings = getUiSettings();
+        const created = [];
+        const renamed = [];
+        let containsCharacterScope = false;
+
+        for (const imported of importedPayload.references) {
+            const uniqueName = makeUniqueReferenceName(imported.name);
+            const reference = createReference(uniqueName, imported.type);
+            reference.content = imported.content;
+            reference.scope = imported.scope;
+            reference.position = imported.position;
+            reference.depth = imported.depth;
+            reference.role = imported.role;
+            reference.autoQuestion = imported.autoQuestion || reference.autoQuestion;
+            // 分享文件不得自动注入到接收者的角色扮演中；导入后必须由用户检查并手动启用。
+            reference.enabled = false;
+            reference.addToCheck = false;
+            reference.characterKey = '';
+            settings.references.push(reference);
+            created.push(reference);
+            if (!importedPayload.isBundle) expandedReferenceIds.add(reference.id);
+            if (uniqueName !== imported.name) renamed.push(`${imported.name} → ${uniqueName}`);
+            if (imported.scope === 'character') containsCharacterScope = true;
+        }
+
+        markDirty();
+        renderAll();
+
+        const modeText = importedPayload.isBundle ? `已从资料库合集导入 ${created.length} 个资料库` : `已导入资料库“${created[0]?.name || ''}”`;
+        const renameNote = renamed.length ? `；${renamed.length} 个重名条目已自动改名` : '';
+        const bindingNote = containsCharacterScope ? '；角色专属绑定不会随文件导入，请手动绑定当前角色' : '';
+        toastr.success(`${modeText}${renameNote}${bindingNote}。为了安全，所有导入资料库均保持关闭，请检查后手动启用并保存。`, '墨提斯之镜 DEV', { timeOut: 8000 });
+    } catch (error) {
+        console.warn('[STSC] 导入参考资料库失败：', error);
+        toastr.error(`格式不匹配，文件错误或不是本插件导出的参考资料库。${error?.message ? ` ${error.message}` : ''}`, '墨提斯之镜 DEV', { timeOut: 7000 });
+    }
+}
+
+function openCreatePresetDialog(kind) {
+    const label = kind === 'character' ? '角色预设' : '通用预设';
+    openDialog(
+        `新建${label}`,
+        `<div class="stscdev-field">
+            <label>预设名称</label>
+            <input id="stscdev_new_preset_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的预设名称">
+            <div id="stscdev_new_preset_error" class="stscdev-dialog-error"></div>
+        </div>
+        <div class="stscdev-muted" style="margin-top:9px">${kind === 'character' ? '创建后默认不绑定角色，需要在角色卡聊天页面中手动绑定。' : '创建后不会自动替换当前通用预设，确认内容后可以手动设为当前通用。'}</div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button" type="button" data-dialog-action="create-preset" data-kind="${kind}">确认创建</button>`
+    );
+    setTimeout(() => $('#stscdev_new_preset_name').trigger('focus'), 0);
+}
+
+function openCreateReferenceDialog() {
+    openDialog(
+        '新建参考资料库',
+        `<div class="stscdev-field">
+            <label>资料库名称</label>
+            <input id="stscdev_new_reference_name" class="text_pole" type="text" maxlength="80" placeholder="请输入不重复的资料库名称">
+        </div>
+        <div class="stscdev-field" style="margin-top:10px">
+            <label>资料类型</label>
+            <select id="stscdev_new_reference_type" class="text_pole">
+                <option value="style">文风</option>
+                <option value="restriction">限制</option>
+                <option value="other">其他</option>
+            </select>
+        </div>
+        <div class="stscdev-reference-type-help">
+            <div><strong>文风：</strong>自动放在主提示词内，并生成“是否遵照该文风、如何体现”的自检问题。</div>
+            <div><strong>限制：</strong>自动以 System 身份插入聊天深度 0，靠近本轮生成位置，并生成强制限制检查问题。</div>
+            <div><strong>其他：</strong>使用通用推荐位置与通用检查问题，之后仍可手动调整。</div>
+        </div>
+        <div id="stscdev_new_reference_error" class="stscdev-dialog-error"></div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button stscdev-primary-button" type="button" data-dialog-action="create-reference">确认创建</button>`
+    );
+    setTimeout(() => $('#stscdev_new_reference_name').trigger('focus'), 0);
+}
+
+function looksLikeQuestion(text) {
+    const value = String(text || '').trim();
+    if (!value) return false;
+    if (/[？?]\s*$/.test(value)) return true;
+    return /^(是否|有无|能否|可否|当前|本轮|此时|角色|两人|他们|应该|应当|如何|为何|为什么|什么|哪|哪些|怎样|怎么|请(?:说明|判断|分析|确认|回答|概括|检查)|根据.+(?:如何|是否|应该))/u.test(value);
+}
+
+function splitBulkQuestions(raw) {
+    const text = String(raw || '').replace(/\r\n?/g, '\n').trim();
+    if (!text) return [];
+
+    const output = text
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean)
+        .map(line => line.replace(/^\s*(?:[-*•·]+|(?:\d+|[一二三四五六七八九十百]+)[\.、：:)）-])\s*/u, '').trim())
+        .filter(Boolean);
+
+    return [...new Set(output)];
+}
+
+function renderBulkImportDialog() {
+    if (!bulkDraft) return;
+    const itemsHtml = bulkDraft.items.length ? bulkDraft.items.map((item, index) => `
+        <div class="stscdev-bulk-item" data-bulk-index="${index}">
+            <div class="stscdev-card-header">
+                <div class="stscdev-card-title">识别结果 ${index + 1}</div>
+                <button class="menu_button stscdev-small-button stscdev-danger-button" type="button" data-dialog-action="delete-bulk-item">删除</button>
+            </div>
+            <textarea class="text_pole stscdev-textarea" data-bulk-field="text">${escapeHtml(item)}</textarea>
+        </div>`).join('') : '<div class="stscdev-empty">还没有识别结果。粘贴内容后点击“开始识别”。</div>';
+
+    openDialog(
+        '批量导入问题',
+        `<div class="stscdev-field">
+            <label>粘贴原始内容</label>
+            <textarea id="stscdev_bulk_raw" class="text_pole stscdev-bulk-raw" placeholder="每行填写一道问题。即使同一行有多个问号，也只会识别为一道问题。">${escapeHtml(bulkDraft.raw)}</textarea>
+        </div>
+        <div class="stscdev-toolbar" style="margin-top:9px">
+            <button class="menu_button" type="button" data-dialog-action="recognize-bulk">开始识别 / 重新识别</button>
+            <button class="menu_button" type="button" data-dialog-action="add-bulk-item">＋ 手动补一条</button>
+        </div>
+        <div class="stscdev-muted" style="margin-top:9px">仅按换行识别：每个非空行视为一道完整问题，不会按问号拆分。识别结果只是临时草稿，可先修改或删除，确认后才会加入当前预设。</div>
+        <div class="stscdev-bulk-preview">${itemsHtml}</div>`,
+        `<button class="menu_button" type="button" data-dialog-action="cancel">取消</button>
+         <button class="menu_button" type="button" data-dialog-action="confirm-bulk" ${bulkDraft.items.length ? '' : 'disabled'}>确认导入（${bulkDraft.items.length}）</button>`
+    );
+}
+
+function openBulkImportDialog(preset) {
+    if (!preset) return;
+    bulkDraft = { presetId: preset.id, raw: '', items: [] };
+    renderBulkImportDialog();
+}
+
+async function testCurrentPreset() {
+    if (testBusy) return;
+    const context = ctx();
+    const settings = getUiSettings();
+    const questions = getActiveQuestions(settings);
+    const references = getActiveReferences(settings);
+    if (!questions.length) {
+        toastr.warning('当前没有生效的问题可以测试。', '墨提斯之镜 DEV');
+        return;
+    }
+
+    testBusy = true;
+    const loader = context.loader?.show?.({
+        message: '正在测试自检预设…',
+        title: '墨提斯之镜 DEV',
+        toastMode: 'stoppable',
+    });
+
+    try {
+        clearRuntimePrompts();
+        applyReferencePrompts(references);
+        const questionText = questions.map((q, i) => `${i + 1}. [${q.type === 'boolean' ? '判断题' : '开放问答'}｜${q.length}｜${q.requireEvidence ? '需要依据' : '无需强制依据'}] ${q.text}`).join('\n');
+        const prompt = `
+这是墨提斯之镜 DEV 插件的“测试预设”功能。请读取当前角色设定、聊天上文、已注入的参考资料以及下面全部问题。
+
+任务：
+1. 逐题正常回答，但绝对不要输出角色扮演正文、对白、动作或状态栏。
+2. 回答完成后输出【测试结论】，判断：问题能否正常理解；哪些问题语义相似；哪些可能冲突；哪些太模糊；问题类型或回答长度是否不合适。
+3. 不要为了给建议而虚构问题。没有明显问题时，明确写“整体可正常使用”。
+
+本次实际生效问题共 ${questions.length} 题：
+${questionText}
+`.trim();
+        internalQuietActive = true;
+        const result = await context.generateQuietPrompt({ quietPrompt: prompt });
+        internalQuietActive = false;
+        lastTestResult = String(result || '').trim() || '测试没有返回内容。';
+        toastr.success('测试完成，没有生成正文。', '墨提斯之镜 DEV');
+        switchTab('presets');
+        renderAll();
+    } catch (error) {
+        internalQuietActive = false;
+        console.error('[STSC] 测试预设失败：', error);
+        toastr.error('测试调用失败，请检查当前API连接。', '墨提斯之镜 DEV');
+    } finally {
+        clearRuntimePrompts();
+        testBusy = false;
+        await loader?.hide?.();
+    }
+}
+
+function bindUiEvents() {
+    $('#stscdev_close_manager').on('click', closeManager);
+    $('#stscdev_save_changes').on('click', () => commitEditDraft());
+    $('#stscdev_floating_button').on('click', function (event) {
+        event.preventDefault();
+        if (Date.now() < suppressFloatingClickUntil) return;
+        toggleFloatingPanel();
+    });
+    $('#stscdev_floating_button').on('pointerdown', beginFloatingDrag);
+    $(document).on('pointermove.stscFloating', moveFloatingDrag);
+    $(document).on('pointerup.stscFloating pointercancel.stscFloating', endFloatingDrag);
+    const closeFloating = (event) => {
+        event?.preventDefault?.();
+        event?.stopPropagation?.();
+        event?.stopImmediatePropagation?.();
+        toggleFloatingPanel(false);
+    };
+    const floatingCloseButton = document.getElementById('stscdev_floating_close');
+    floatingCloseButton?.addEventListener('pointerup', closeFloating, { passive: false });
+    floatingCloseButton?.addEventListener('touchend', closeFloating, { passive: false });
+    floatingCloseButton?.addEventListener('click', closeFloating, { passive: false });
+    $('#stscdev_floating_open_manager').on('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleFloatingPanel(false);
+        openManager(floatingPanelPage === 'instructions' ? 'temporary' : 'status');
+    });
+    $('#stscdev_floating_panel').on('click', '[data-floating-page]', function (event) {
+        event.preventDefault();
+        const nextPage = $(this).data('floating-page') === 'instructions' ? 'instructions' : 'check';
+        if (floatingPanelPage === nextPage) return;
+        floatingPanelPage = nextPage;
+        renderFloating();
+        if (floatingPanelPage === 'check' && !$('#stscdev_floating_panel').hasClass('stscdev-hidden')) void markLatestIssueViewed();
+    });
+    $('#stscdev_floating_panel').on('change', '[data-floating-instruction-mode]', function () {
+        const id = $(this).closest('[data-floating-temp-id]').data('floating-temp-id');
+        const previous = instructionActivationMode(id, normalizeSettings());
+        if (!setInstructionActivation(id, this.value)) this.value = previous;
+    });
+    $('#stscdev_dialog_close').on('click', closeDialog);
+
+    // 不再点击黑色背景关闭，避免用户拖选/复制文字时误退出插件。
+    $(document).on('keydown.stsc', function (event) {
+        if (event.key !== 'Escape') return;
+        if (!$('#stscdev_dialog_overlay').hasClass('stscdev-hidden')) closeDialog();
+        else if (!$('#stscdev_manager_overlay').hasClass('stscdev-hidden')) closeManager();
+    });
+
+    $('#stscdev_manager_overlay').on('click', '.stscdev-tab', function () {
+        switchTab($(this).data('tab'));
+    });
+
+    $('#stscdev_manager_overlay').on('click', '[data-preset-section]', function () {
+        const next = $(this).data('preset-section') === 'character' ? 'character' : 'general';
+        if (next === getUiSettings().ui.presetSection) return;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.presetSection = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_general_preset_select', function () {
+        const next = this.value;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.editingGeneralPresetId = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_character_preset_select', function () {
+        const next = this.value;
+        requestUnsavedDecision(() => {
+            getUiSettings().ui.editingCharacterPresetId = next;
+            renderPresetsTab();
+            updateSaveState();
+        });
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_preset_name', function () {
+        const preset = getEditingPreset();
+        if (!preset) return;
+        const nextName = String(this.value || '').trim();
+        if (!nextName) {
+            toastr.warning('预设名称不能为空。', '墨提斯之镜 DEV');
+            renderPresetsTab();
+            return;
+        }
+        if (presetNameExists(nextName, preset.id)) {
+            toastr.warning('已经存在同名预设，请换一个名称。', '墨提斯之镜 DEV');
+            renderPresetsTab();
+            return;
+        }
+        preset.name = nextName;
+        markDirty();
+        renderAll();
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_preset_enabled', function () {
+        const preset = getEditingPreset();
+        if (!preset) return;
+        preset.enabled = this.checked;
+        markDirty();
+        renderAll();
+    });
+
+    $('#stscdev_manager_overlay').on('input change', '[data-question-field]', function () {
+        const preset = getEditingPreset();
+        const card = $(this).closest('[data-question-id]');
+        const question = preset?.questions.find(x => x.id === card.data('question-id'));
+        if (!question) return;
+        const field = $(this).data('question-field');
+        question[field] = this.type === 'checkbox' ? this.checked : this.value;
+        if (field === 'enabled') card.find('.stscdev-summary-enable span').text(question.enabled ? '已启用' : '未启用');
+        if (field === 'text') card.find('.stscdev-question-summary-text span').text(String(question.text || '').trim() || '未填写问题内容');
+        markDirty();
+        renderCompact();
+        renderManagerSubtitle();
+    });
+
+    $('#stscdev_manager_overlay').on('input change', '[data-reference-field]', function (event) {
+        const $card = $(this).closest('[data-reference-id]');
+        const id = $card.data('reference-id');
+        const reference = getUiSettings().references.find(x => x.id === id);
+        if (!reference) return;
+        const field = $(this).data('reference-field');
+
+        if (field === 'name') {
+            const nextName = String(this.value || '').trim();
+            const $error = $card.find('[data-reference-name-error]');
+            if (!nextName) {
+                $error.text('资料库名称不能为空。');
+                if (event.type === 'change') {
+                    this.value = reference.name;
+                    $error.empty();
+                    toastr.warning('资料库名称不能为空。', '墨提斯之镜 DEV');
+                }
+                return;
+            }
+            if (referenceNameExists(nextName, reference.id)) {
+                $error.text('已经存在同名资料库，请换一个名称。');
+                if (event.type === 'change') {
+                    this.value = reference.name;
+                    $error.empty();
+                    toastr.warning('已经存在同名资料库，请换一个名称。', '墨提斯之镜 DEV');
+                }
+                return;
+            }
+            $error.empty();
+            reference.name = nextName;
+            $card.find('.stscdev-reference-summary-name').text(nextName);
+            markDirty();
+            renderCompact();
+            renderManagerSubtitle();
+            return;
+        }
+
+        if (field === 'enabled') {
+            reference.enabled = this.checked;
+            if (!reference.enabled) reference.addToCheck = false;
+            markDirty();
+            renderReferencesTab();
+            renderCompact();
+            renderManagerSubtitle();
+            return;
+        }
+
+        if (field === 'type') {
+            applyReferenceTypeDefaults(reference, this.value);
+            markDirty();
+            renderReferencesTab();
+            renderCompact();
+            renderManagerSubtitle();
+            toastr.info(`已切换为“${referenceTypeLabel(reference.type)}”，并应用推荐注入位置。`, '墨提斯之镜 DEV');
+            return;
+        }
+
+        if (field === 'addToCheck') {
+            if (!reference.enabled) {
+                reference.addToCheck = false;
+                this.checked = false;
+                toastr.warning('请先启用这个资料库，才能启用对应的自检问题。', '墨提斯之镜 DEV');
+                return;
+            }
+            reference.addToCheck = this.checked;
+        } else {
+            reference[field] = this.type === 'checkbox' ? this.checked : this.value;
+        }
+
+        if (field === 'depth') reference.depth = clampNumber(reference.depth, 0, 20, 0);
+        markDirty();
+        renderCompact();
+        renderManagerSubtitle();
+    });
+
+    $('#stscdev_manager_overlay').on('input change', '[data-temp-field]', function () {
+        const $card = $(this).closest('[data-temp-id]');
+        const id = $card.data('temp-id');
+        const instruction = getUiSettings().temporaryInstructions.find(x => x.id === id);
+        if (!instruction) return;
+        const field = $(this).data('temp-field');
+        instruction[field] = this.value;
+        if (field === 'name') $card.find('.stscdev-temp-summary-text b').text(instruction.name || '未命名快捷指令');
+        if (field === 'content') $card.find('.stscdev-temp-summary-text span').text(String(instruction.content || '').trim() || '尚未填写指令内容');
+        markDirty();
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_setting_enabled', function () {
+        getUiSettings().enabled = this.checked;
+        markDirty();
+        renderAll();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_setting_mode', function () {
+        getUiSettings().mode = this.value;
+        markDirty();
+        renderAll();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_general_enabled', function () {
+        getUiSettings().generalEnabled = this.checked;
+        markDirty();
+        renderAll();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_character_enabled', function () {
+        getUiSettings().characterEnabled = this.checked;
+        markDirty();
+        renderAll();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_injection_position', function () {
+        getUiSettings().injection.position = this.value;
+        markDirty();
+        renderAll();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_injection_depth', function () {
+        getUiSettings().injection.depth = clampNumber(this.value, 0, 20, 0);
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_injection_role', function () {
+        getUiSettings().injection.role = this.value;
+        markDirty();
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_theme', function () {
+        getUiSettings().appearance.theme = this.value;
+        markDirty();
+        applyTheme(getUiSettings());
+        renderFloating();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_floating_enabled', function () {
+        getUiSettings().appearance.floatingEnabled = this.checked;
+        markDirty();
+        renderFloating();
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_floating_style', function () {
+        getUiSettings().appearance.floatingStyle = this.value;
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_floating_opacity', function () {
+        getUiSettings().appearance.floatingOpacity = clampNumber(Number(this.value) / 100, 0.1, 1, 0.94);
+        $('#stscdev_floating_opacity_value').text(`${Math.round(getUiSettings().appearance.floatingOpacity * 100)}%`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_floating_button_size', function () {
+        getUiSettings().appearance.floatingButtonSize = clampNumber(this.value, 34, 50, 50);
+        $('#stscdev_floating_button_size_value').text(`${Math.round(getUiSettings().appearance.floatingButtonSize)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        applyFloatingPosition(getUiSettings());
+        if (!$('#stscdev_floating_panel').hasClass('stscdev-hidden')) layoutFloatingPanel();
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_floating_width', function () {
+        getUiSettings().appearance.floatingWidth = clampNumber(this.value, 300, 680, 420);
+        $('#stscdev_floating_width_value').text(`${Math.round(getUiSettings().appearance.floatingWidth)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+    $('#stscdev_manager_overlay').on('input change', '#stscdev_floating_height', function () {
+        getUiSettings().appearance.floatingHeight = clampNumber(this.value, 300, 820, 640);
+        $('#stscdev_floating_height_value').text(`${Math.round(getUiSettings().appearance.floatingHeight)}px`);
+        markDirty();
+        applyFloatingAppearance(getUiSettings());
+        layoutFloatingPanel();
+    });
+
+    $('#stscdev_manager_overlay').on('click', '[data-action]', async function () {
+        const action = $(this).data('action');
+        const settings = getUiSettings();
+        const preset = getEditingPreset(null, settings);
+
+        if (action === 'open-create-preset') {
+            openCreatePresetDialog($(this).data('kind'));
+            return;
+        } else if (action === 'open-create-reference') {
+            openCreateReferenceDialog();
+            return;
+        } else if (action === 'batch-export-references') {
+            openBatchReferenceExportDialog();
+            return;
+        } else if (action === 'check-plugin-update') {
+            await checkForPluginUpdate({ force: true });
+            renderUpdatesTab();
+            return;
+        } else if (action === 'update-plugin-now') {
+            await updatePluginFromManager();
+            return;
+        } else if (action === 'open-extension-manager') {
+            openManager('updates');
+            return;
+        } else if (action === 'import-reference') {
+            const input = document.getElementById('stscdev_reference_import_file');
+            if (input) {
+                input.value = '';
+                input.click();
+            }
+            return;
+        } else if (action === 'toggle-reference-collapse') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            if (expandedReferenceIds.has(id)) expandedReferenceIds.delete(id);
+            else expandedReferenceIds.add(id);
+            renderReferencesTab();
+            return;
+        } else if (action === 'toggle-question-collapse') {
+            const id = $(this).closest('[data-question-id]').data('question-id');
+            if (expandedQuestionIds.has(id)) expandedQuestionIds.delete(id);
+            else expandedQuestionIds.add(id);
+            renderPresetsTab();
+            return;
+        } else if (action === 'toggle-temp-collapse') {
+            const id = $(this).closest('[data-temp-id]').data('temp-id');
+            if (expandedInstructionIds.has(id)) expandedInstructionIds.delete(id);
+            else expandedInstructionIds.add(id);
+            renderTemporaryTab();
+            return;
+        } else if (action === 'export-preset') {
+            downloadPresetFile(preset);
+            return;
+        } else if (action === 'import-preset') {
+            const input = document.getElementById('stscdev_preset_import_file');
+            if (input) {
+                input.value = '';
+                input.click();
+            }
+            return;
+        } else if (action === 'copy-preset' && preset) {
+            const copied = clone(preset);
+            copied.id = uid('preset');
+            copied.name = makeUniquePresetName(`${preset.name} 副本`);
+            copied.builtinKey = '';
+            copied.questions = copied.questions.map(q => ({ ...q, id: uid('q') }));
+            copied.boundCharacterKey = '';
+            copied.boundCharacterName = '';
+            settings.presets.push(copied);
+            if (copied.kind === 'character') settings.ui.editingCharacterPresetId = copied.id;
+            else settings.ui.editingGeneralPresetId = copied.id;
+        } else if (action === 'delete-preset' && preset) {
+            if (preset.kind === 'general' && settings.presets.filter(x => x.kind === 'general').length <= 1) {
+                toastr.warning('至少要保留一个通用预设。', '墨提斯之镜 DEV');
+                return;
+            }
+            openDeleteConfirmation({
+                title: '确认删除预设',
+                message: `确定删除预设“${preset.name}”吗？`,
+                detail: `其中包含 ${preset.questions.length} 个问题。`,
+                perform: () => {
+                    settings.presets = settings.presets.filter(x => x.id !== preset.id);
+                    for (const question of preset.questions) expandedQuestionIds.delete(question.id);
+                    if (preset.kind === 'general') {
+                        const remaining = settings.presets.filter(x => x.kind === 'general');
+                        if (settings.generalPresetId === preset.id) settings.generalPresetId = remaining[0]?.id || '';
+                        settings.ui.editingGeneralPresetId = remaining[0]?.id || '';
+                    } else {
+                        settings.ui.editingCharacterPresetId = settings.presets.find(x => x.kind === 'character')?.id || '';
+                    }
+                    markDirty();
+                    renderAll();
+                },
+            });
+            return;
+        } else if (action === 'set-general-preset' && preset?.kind === 'general') {
+            settings.generalPresetId = preset.id;
+            settings.generalEnabled = true;
+            toastr.success(`已将“${preset.name}”设为当前通用预设。`, '墨提斯之镜 DEV');
+        } else if (action === 'bind-current-character' && preset?.kind === 'character') {
+            const character = getCurrentCharacterEntity();
+            if (!character.key) {
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '墨提斯之镜 DEV');
+                return;
+            }
+            for (const other of settings.presets.filter(x => x.kind === 'character' && x.id !== preset.id && x.boundCharacterKey === character.key)) {
+                other.boundCharacterKey = '';
+                other.boundCharacterName = '';
+            }
+            preset.boundCharacterKey = character.key;
+            preset.boundCharacterName = character.name;
+            settings.characterEnabled = true;
+            toastr.success(`已将“${preset.name}”绑定到 ${character.name}。`, '墨提斯之镜 DEV');
+        } else if (action === 'unbind-preset' && preset?.kind === 'character') {
+            preset.boundCharacterKey = '';
+            preset.boundCharacterName = '';
+        } else if (action === 'test-preset') {
+            await testCurrentPreset();
+            return;
+        } else if (action === 'add-question' && preset) {
+            const question = createQuestion();
+            preset.questions.push(question);
+            expandedQuestionIds.add(question.id);
+        } else if (action === 'open-batch-import' && preset) {
+            openBulkImportDialog(preset);
+            return;
+        } else if (['delete-question', 'move-question-up', 'move-question-down'].includes(action) && preset) {
+            const id = $(this).closest('[data-question-id]').data('question-id');
+            const index = preset.questions.findIndex(x => x.id === id);
+            const question = index >= 0 ? preset.questions[index] : null;
+            if (action === 'delete-question' && question) {
+                openDeleteConfirmation({
+                    title: '确认删除问题',
+                    message: `确定删除 Q${index + 1} 吗？`,
+                    detail: String(question.text || '').trim() || '这个问题尚未填写内容。',
+                    perform: () => {
+                        const currentIndex = preset.questions.findIndex(item => item.id === id);
+                        if (currentIndex >= 0) preset.questions.splice(currentIndex, 1);
+                        expandedQuestionIds.delete(id);
+                        markDirty();
+                        renderAll();
+                    },
+                });
+                return;
+            }
+            if (index > 0 && action === 'move-question-up') [preset.questions[index - 1], preset.questions[index]] = [preset.questions[index], preset.questions[index - 1]];
+            if (index >= 0 && index < preset.questions.length - 1 && action === 'move-question-down') [preset.questions[index + 1], preset.questions[index]] = [preset.questions[index], preset.questions[index + 1]];
+        } else if (action === 'export-reference') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            const reference = settings.references.find(item => item.id === id);
+            downloadReferenceFile(reference);
+            return;
+        } else if (action === 'delete-reference') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            const reference = settings.references.find(item => item.id === id);
+            if (!reference) return;
+            openDeleteConfirmation({
+                title: '确认删除资料库',
+                message: `确定删除资料库“${reference.name}”吗？`,
+                detail: `类型：${referenceTypeLabel(reference.type)}。资料内容与关联的自动自检问题都会一起删除。`,
+                perform: () => {
+                    settings.references = settings.references.filter(item => item.id !== id);
+                    expandedReferenceIds.delete(id);
+                    markDirty();
+                    renderAll();
+                },
+            });
+            return;
+        } else if (action === 'bind-reference-character') {
+            const id = $(this).closest('[data-reference-id]').data('reference-id');
+            const reference = settings.references.find(x => x.id === id);
+            const character = getCurrentCharacterEntity();
+            if (!reference || !character.key) {
+                toastr.warning('当前页面未找到角色卡，请先进入一个角色卡聊天页面。', '墨提斯之镜 DEV');
+                return;
+            }
+            reference.scope = 'character';
+            reference.characterKey = character.key;
+        } else if (action === 'add-temp') {
+            const instruction = createTemporaryInstruction();
+            settings.temporaryInstructions.push(instruction);
+            expandedInstructionIds.add(instruction.id);
+        } else if (action === 'delete-temp') {
+            const id = $(this).closest('[data-temp-id]').data('temp-id');
+            const instruction = settings.temporaryInstructions.find(item => item.id === id);
+            if (!instruction) return;
+            openDeleteConfirmation({
+                title: '确认删除快捷指令',
+                message: `确定删除指令“${instruction.name}”吗？`,
+                detail: String(instruction.content || '').trim() || '这条指令尚未填写内容。',
+                perform: () => {
+                    settings.temporaryInstructions = settings.temporaryInstructions.filter(item => item.id !== id);
+                    settings.pendingInstructionIds = settings.pendingInstructionIds.filter(value => value !== id);
+                    settings.persistentInstructionIds = settings.persistentInstructionIds.filter(value => value !== id);
+                    expandedInstructionIds.delete(id);
+                    markDirty();
+                    renderAll();
+                },
+            });
+            return;
+        } else {
+            return;
+        }
+
+        markDirty();
+        renderAll();
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_preset_import_file', async function () {
+        const file = this.files?.[0] || null;
+        this.value = '';
+        await importPresetFile(file);
+    });
+
+    $('#stscdev_manager_overlay').on('change', '#stscdev_reference_import_file', async function () {
+        const file = this.files?.[0] || null;
+        this.value = '';
+        await importReferenceFile(file);
+    });
+
+    $('#stscdev_dialog_overlay').on('change', '[data-batch-reference-id]', function () {
+        const count = $('#stscdev_dialog_body [data-batch-reference-id]:checked').length;
+        $('#stscdev_batch_reference_count').text(`已选择 ${count} 个`);
+    });
+
+    $('#stscdev_dialog_overlay').on('input', '#stscdev_bulk_raw', function () {
+        if (bulkDraft) bulkDraft.raw = this.value;
+    });
+
+    $('#stscdev_dialog_overlay').on('input', '[data-bulk-field="text"]', function () {
+        if (!bulkDraft) return;
+        const index = Number($(this).closest('[data-bulk-index]').data('bulk-index'));
+        if (Number.isInteger(index) && bulkDraft.items[index] !== undefined) bulkDraft.items[index] = this.value;
+    });
+
+    $('#stscdev_dialog_overlay').on('keydown', '#stscdev_new_preset_name', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            $('#stscdev_dialog_overlay [data-dialog-action="create-preset"]').trigger('click');
+        }
+    });
+
+    $('#stscdev_dialog_overlay').on('keydown', '#stscdev_new_reference_name', function (event) {
+        if (event.key === 'Enter') {
+            event.preventDefault();
+            $('#stscdev_dialog_overlay [data-dialog-action="create-reference"]').trigger('click');
+        }
+    });
+
+    $('#stscdev_dialog_overlay').on('click', '[data-dialog-action]', function () {
+        const action = $(this).data('dialog-action');
+        const settings = getUiSettings();
+
+        if (action === 'unsaved-cancel') {
+            pendingUnsavedAction = null;
+            closeDialog();
+            renderAll();
+            return;
+        }
+        if (action === 'unsaved-discard') {
+            const next = pendingUnsavedAction;
+            pendingUnsavedAction = null;
+            closeDialog();
+            discardEditDraft();
+            next?.();
+            return;
+        }
+        if (action === 'unsaved-save') {
+            const next = pendingUnsavedAction;
+            pendingUnsavedAction = null;
+            closeDialog();
+            commitEditDraft({ notify: false });
+            next?.();
+            return;
+        }
+
+        if (action === 'cancel') {
+            closeDialog();
+            return;
+        }
+        if (action === 'confirm-delete') {
+            const request = pendingDeleteRequest;
+            pendingDeleteRequest = null;
+            closeDialog();
+            request?.();
+            return;
+        }
+        if (action === 'batch-reference-select-all' || action === 'batch-reference-select-none') {
+            const checked = action === 'batch-reference-select-all';
+            $('#stscdev_dialog_body [data-batch-reference-id]').prop('checked', checked).trigger('change');
+            return;
+        }
+        if (action === 'confirm-batch-reference-export') {
+            const ids = $('#stscdev_dialog_body [data-batch-reference-id]:checked').map((_, element) => String($(element).data('batch-reference-id') || '')).get().filter(Boolean);
+            const references = settings.references.filter(reference => ids.includes(reference.id));
+            if (!references.length) {
+                toastr.warning('请至少选择一个要导出的资料库。', '墨提斯之镜 DEV');
+                return;
+            }
+            if (downloadReferenceBundleFile(references)) closeDialog();
+            return;
+        }
+        if (action === 'create-preset') {
+            const kind = $(this).data('kind') === 'character' ? 'character' : 'general';
+            const name = String($('#stscdev_new_preset_name').val() || '').trim();
+            if (!name) {
+                $('#stscdev_new_preset_error').text('请输入预设名称。');
+                return;
+            }
+            if (presetNameExists(name)) {
+                $('#stscdev_new_preset_error').text('已经存在同名预设，请换一个名称。');
+                return;
+            }
+            const preset = createPreset(name, kind);
+            settings.presets.push(preset);
+            settings.ui.presetSection = kind;
+            if (kind === 'character') settings.ui.editingCharacterPresetId = preset.id;
+            else settings.ui.editingGeneralPresetId = preset.id;
+            markDirty();
+            closeDialog();
+            renderAll();
+            return;
+        }
+        if (action === 'create-reference') {
+            const name = String($('#stscdev_new_reference_name').val() || '').trim();
+            const type = Object.hasOwn(REFERENCE_TYPE_CONFIG, $('#stscdev_new_reference_type').val())
+                ? $('#stscdev_new_reference_type').val()
+                : 'other';
+            if (!name) {
+                $('#stscdev_new_reference_error').text('请输入资料库名称。');
+                return;
+            }
+            if (referenceNameExists(name)) {
+                $('#stscdev_new_reference_error').text('已经存在同名资料库，请换一个名称。');
+                return;
+            }
+            const reference = createReference(name, type);
+            settings.references.push(reference);
+            markDirty();
+            closeDialog();
+            renderAll();
+            setTimeout(() => document.querySelector(`[data-reference-id="${CSS.escape(reference.id)}"]`)?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' }), 0);
+            return;
+        }
+        if (action === 'recognize-bulk') {
+            if (!bulkDraft) return;
+            bulkDraft.raw = String($('#stscdev_bulk_raw').val() || '');
+            bulkDraft.items = splitBulkQuestions(bulkDraft.raw);
+            if (!bulkDraft.items.length) toastr.warning('没有识别到明显的问题，请调整原文或手动补充。', '墨提斯之镜 DEV');
+            renderBulkImportDialog();
+            return;
+        }
+        if (action === 'add-bulk-item') {
+            if (!bulkDraft) return;
+            bulkDraft.raw = String($('#stscdev_bulk_raw').val() || bulkDraft.raw || '');
+            bulkDraft.items.push('');
+            renderBulkImportDialog();
+            setTimeout(() => $('#stscdev_dialog_body [data-bulk-field="text"]').last().trigger('focus'), 0);
+            return;
+        }
+        if (action === 'delete-bulk-item') {
+            if (!bulkDraft) return;
+            const index = Number($(this).closest('[data-bulk-index]').data('bulk-index'));
+            if (Number.isInteger(index)) bulkDraft.items.splice(index, 1);
+            renderBulkImportDialog();
+            return;
+        }
+        if (action === 'confirm-bulk') {
+            if (!bulkDraft) return;
+            const preset = settings.presets.find(x => x.id === bulkDraft.presetId);
+            const items = bulkDraft.items.map(x => String(x || '').trim()).filter(Boolean);
+            if (!preset || !items.length) {
+                toastr.warning('没有可以导入的问题。', '墨提斯之镜 DEV');
+                return;
+            }
+            const createdQuestions = items.map(text => createQuestion(text));
+            preset.questions.push(...createdQuestions);
+            for (const question of createdQuestions) expandedQuestionIds.add(question.id);
+            markDirty();
+            const count = items.length;
+            closeDialog();
+            renderAll();
+            toastr.success(`已确认导入 ${count} 个问题。`, '墨提斯之镜 DEV');
+        }
+    });
+
+    const refreshFloatingLayout = () => {
+        applyFloatingPosition(editDraft || normalizeSettings());
+        layoutFloatingPanel();
+    };
+    $(window).on('resize.stscFloating orientationchange.stscFloating', refreshFloatingLayout);
+    window.visualViewport?.addEventListener?.('resize', refreshFloatingLayout);
+    window.visualViewport?.addEventListener?.('scroll', refreshFloatingLayout);
+
+    window.addEventListener('beforeunload', function (event) {
+        if (!editDirty) return;
+        event.preventDefault();
+        event.returnValue = '';
+    });
+}
+
+
+function openExtensionManagerForUpdate() {
+    const detailsButton = document.querySelector('#extensions_details');
+    if (detailsButton) {
+        detailsButton.click();
+        return;
+    }
+
+    const menuButton = document.querySelector('#extensionsMenuButton');
+    menuButton?.click?.();
+    setTimeout(() => {
+        const retryButton = document.querySelector('#extensions_details');
+        if (retryButton) retryButton.click();
+        else window.open('https://github.com/chenxyeah/SillyTavern-Self-Check', '_blank', 'noopener,noreferrer');
+    }, 150);
+}
+
+async function getInstalledExtensionType() {
+    const context = ctx();
+    try {
+        const response = await fetch('/api/extensions/discover', {
+            method: 'GET',
+            headers: context?.getRequestHeaders?.(),
+        });
+        if (!response.ok) return 'local';
+        const extensions = await response.json();
+        const match = Array.isArray(extensions)
+            ? extensions.find(item => item?.name === `third-party/${STSC_EXTENSION_FOLDER_NAME}`)
+            : null;
+        return match?.type === 'global' ? 'global' : 'local';
+    } catch (error) {
+        console.debug('[STSC] 无法判断插件安装位置，将按本地扩展检查更新。', error);
+        return 'local';
+    }
+}
+
+async function fetchOwnExtensionVersion(isGlobal) {
+    const context = ctx();
+    const response = await fetch('/api/extensions/version', {
+        method: 'POST',
+        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            extensionName: STSC_EXTENSION_FOLDER_NAME,
+            global: Boolean(isGlobal),
+        }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return await response.json();
+}
+
+function compareVersions(left, right) {
+    const parse = value => String(value || '')
+        .trim()
+        .replace(/^v/i, '')
+        .split(/[.-]/)
+        .map(part => (/^\d+$/.test(part) ? Number(part) : part));
+    const a = parse(left);
+    const b = parse(right);
+    const length = Math.max(a.length, b.length);
+    for (let index = 0; index < length; index += 1) {
+        const av = a[index] ?? 0;
+        const bv = b[index] ?? 0;
+        if (typeof av === 'number' && typeof bv === 'number') {
+            if (av !== bv) return av > bv ? 1 : -1;
+            continue;
+        }
+        const result = String(av).localeCompare(String(bv), undefined, { numeric: true, sensitivity: 'base' });
+        if (result !== 0) return result > 0 ? 1 : -1;
+    }
+    return 0;
+}
+
+async function fetchRemoteManifestVersion() {
+    const separator = STSC_REMOTE_MANIFEST_URL.includes('?') ? '&' : '?';
+    const response = await fetch(`${STSC_REMOTE_MANIFEST_URL}${separator}stsc=${Date.now()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`远程 manifest HTTP ${response.status}`);
+    const manifest = await response.json();
+    const version = String(manifest?.version || '').trim();
+    if (!version) throw new Error('远程 manifest 缺少版本号');
+    return version;
+}
+
+
+async function fetchRemoteReleaseInfo() {
+    const separator = STSC_REMOTE_RELEASE_URL.includes('?') ? '&' : '?';
+    const response = await fetch(`${STSC_REMOTE_RELEASE_URL}${separator}stsc=${Date.now()}`, {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+    });
+    if (!response.ok) throw new Error(`远程版本说明 HTTP ${response.status}`);
+    const info = await response.json();
+    const version = String(info?.version || '').trim();
+    if (!version) throw new Error('远程版本说明缺少版本号');
+    return {
+        version,
+        releasedAt: String(info?.releasedAt || ''),
+        title: String(info?.title || ''),
+        changes: Array.isArray(info?.changes) ? info.changes.filter(item => typeof item === 'string').slice(0, 30) : [],
+    };
+}
+
+function markInstalledReleaseSeen() {
+    const settings = normalizeSettings();
+    if (!settings?.updateNotice || settings.updateNotice.lastSeenInstalledVersion === STSC_VERSION) return;
+    settings.updateNotice.lastSeenInstalledVersion = STSC_VERSION;
+    saveSettings();
+}
+
+function clearPluginUpdateNotice() {
+    updateAvailableVersion = '';
+    latestRemoteReleaseInfo = null;
+    $('#stscdev_extensions_menu_button').removeClass('stscdev-has-update').find('.stscdev-menu-update-badge').remove();
+    if (updateToast) {
+        try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
+        updateToast = null;
+    }
+}
+
+function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
+    updateAvailableVersion = String(remoteVersion || releaseInfo?.version || '').trim();
+    latestRemoteReleaseInfo = releaseInfo || latestRemoteReleaseInfo;
+    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
+        clearPluginUpdateNotice();
+        return;
+    }
+
+    const $menuButton = $('#stscdev_extensions_menu_button');
+    $menuButton.addClass('stscdev-has-update');
+    if (!$menuButton.find('.stscdev-menu-update-badge').length) {
+        $menuButton.append('<span class="stscdev-menu-update-badge">更新</span>');
+    }
+
+    const settings = normalizeSettings();
+    if (settings?.updateNotice?.lastNotifiedVersion === updateAvailableVersion || updateToast) return;
+    if (settings?.updateNotice) {
+        settings.updateNotice.lastNotifiedVersion = updateAvailableVersion;
+        settings.updateNotice.lastNotifiedAt = Date.now();
+        saveSettings();
+    }
+
+    const versionText = ` v${updateAvailableVersion}`;
+    const detail = Array.isArray(releaseInfo?.changes) && releaseInfo.changes.length
+        ? ` 更新内容：${releaseInfo.changes.slice(0, 2).join('；')}`
+        : '';
+    updateToast = toastr.info(
+        `检测到“墨提斯之镜 DEV”有新版本${versionText}。${detail} 点击打开插件内更新页面。`,
+        '插件有更新｜立即查看',
+        {
+            timeOut: 0,
+            extendedTimeOut: 0,
+            closeButton: true,
+            tapToDismiss: false,
+            onclick: () => openManager('updates'),
+            onHidden: () => { updateToast = null; },
+        },
+    );
+}
+
+async function updatePluginFromManager() {
+    if (updateCheckInFlight || updateCheckState === 'updating') return;
+    if (editDirty) {
+        toastr.warning('当前还有未保存的修改，请先点击“保存更改”再更新插件。', '墨提斯之镜 DEV');
+        return;
+    }
+    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
+        await checkForPluginUpdate({ force: true });
+        if (updateCheckState !== 'available') return;
+    }
+
+    updateCheckInFlight = true;
+    updateCheckState = 'updating';
+    updateCheckError = '';
+    renderUpdatesTab();
+
+    try {
+        const installType = await getInstalledExtensionType();
+        const context = ctx();
+        const response = await fetch('/api/extensions/update', {
+            method: 'POST',
+            headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                extensionName: STSC_EXTENSION_FOLDER_NAME,
+                global: installType === 'global',
+            }),
+        });
+        if (!response.ok) {
+            const text = await response.text();
+            throw new Error(text || `HTTP ${response.status}`);
+        }
+        const result = await response.json();
+        if (result?.isUpToDate) {
+            updateCheckState = 'available';
+            toastr.warning('远程版本号较新，但 Git 未拉取到新提交。请确认插件安装分支为 main，或重新安装插件。', '插件未能更新');
+            return;
+        }
+
+        const installedTargetVersion = updateAvailableVersion;
+        clearPluginUpdateNotice();
+        toastr.success(`已拉取新版本${installedTargetVersion ? ` v${installedTargetVersion}` : ''}，页面即将刷新。`, '插件更新成功', {
+            timeOut: 1400,
+            extendedTimeOut: 0,
+        });
+        setTimeout(() => window.location.reload(), 900);
+    } catch (error) {
+        updateCheckState = 'error';
+        updateCheckError = error?.message || String(error || '未知错误');
+        console.error('[STSC] 插件内更新失败：', error);
+        toastr.error(updateCheckError, '插件更新失败', { timeOut: 6000 });
+    } finally {
+        updateCheckInFlight = false;
+        if (updateCheckState !== 'updating') renderUpdatesTab();
+    }
+}
+
+async function checkForPluginUpdate({ force = false } = {}) {
+    if (updateCheckInFlight) return;
+
+    const now = Date.now();
+    if (!force && now - lastRuntimeUpdateCheckAt < STSC_UPDATE_CHECK_INTERVAL_MS) return;
+    lastRuntimeUpdateCheckAt = now;
+    updateCheckInFlight = true;
+    updateCheckState = 'checking';
+    updateCheckError = '';
+    if (initialized) renderUpdatesTab();
+
+    const settings = normalizeSettings();
+    if (settings?.updateNotice) {
+        settings.updateNotice.lastCheckedAt = now;
+        saveSettings();
+    }
+
+    try {
+        const installType = await getInstalledExtensionType();
+        const [gitResult, manifestResult, releaseResult] = await Promise.allSettled([
+            fetchOwnExtensionVersion(installType === 'global'),
+            fetchRemoteManifestVersion(),
+            fetchRemoteReleaseInfo(),
+        ]);
+
+        const manifestVersion = manifestResult.status === 'fulfilled' ? manifestResult.value : '';
+        const releaseInfo = releaseResult.status === 'fulfilled' ? releaseResult.value : null;
+        const remoteVersion = [manifestVersion, releaseInfo?.version]
+            .filter(Boolean)
+            .sort((a, b) => compareVersions(b, a))[0] || '';
+        const semanticVersionHasUpdate = Boolean(remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0);
+
+        latestRemoteReleaseInfo = releaseInfo;
+        if (semanticVersionHasUpdate) {
+            updateCheckState = 'available';
+            showPluginUpdateNotice(remoteVersion, releaseInfo);
+        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled' || releaseResult.status === 'fulfilled') {
+            updateCheckState = 'latest';
+            clearPluginUpdateNotice();
+        } else {
+            throw new Error('Git 检查、远程版本检查与版本说明检查均失败');
+        }
+    } catch (error) {
+        updateCheckState = 'error';
+        updateCheckError = error?.message || String(error || '未知错误');
+        console.debug('[STSC] 插件更新检查失败：', error);
+    } finally {
+        updateCheckInFlight = false;
+        if (initialized) renderUpdatesTab();
+    }
+}
+
+function addExtensionsMenuButton() {
+    if ($('#stscdev_extensions_menu_button').length || !$('#extensionsMenu').length) return;
+    const button = $(
+        `<div id="stscdev_extensions_menu_button" class="list-group-item flex-container flexGap5 interactable" title="打开墨提斯之镜 DEV">
+            <i class="fa-solid fa-list-check"></i>
+            <span>墨提斯之镜 DEV</span>
+        </div>`
+    );
+    button.on('click', () => openManager('status'));
+    $('#extensionsMenu').append(button);
+}
+
+async function initialize() {
+    if (initialized) return;
+    const context = ctx();
+    if (!context) return;
+
+    normalizeSettings();
+    const html = await context.renderExtensionTemplateAsync(STSC_FOLDER, 'settings');
+    // 管理器直接挂到 body，避免被“扩展”侧栏的宽度、overflow 或 transform 裁切。
+    $('#stscdev_manager_overlay, #stscdev_dialog_overlay, #stscdev_floating_root, #stscdev_floating_panel').remove();
+    $('body').append(html);
+    removeLegacyMessageBadges();
+    initialized = true;
+    bindUiEvents();
+    addExtensionsMenuButton();
+    const events = context.eventTypes || context.event_types;
+    context.eventSource.on(events.MESSAGE_RECEIVED, handleMessageReceived);
+    context.eventSource.on(events.CHAT_CHANGED, renderAll);
+    context.eventSource.on(events.GENERATION_ENDED, onGenerationEnded);
+    context.eventSource.on(events.GENERATION_STOPPED, onGenerationStopped);
+
+    renderAll();
+    markInstalledReleaseSeen();
+    setTimeout(() => void checkForPluginUpdate({ force: true }), 2500);
+    if (updatePollTimer) clearInterval(updatePollTimer);
+    updatePollTimer = setInterval(() => void checkForPluginUpdate(), STSC_UPDATE_CHECK_INTERVAL_MS);
+    console.info(`[STSC] 墨提斯之镜 DEV v${STSC_VERSION} 已加载。`);
+}
+
+jQuery(() => {
+    const context = ctx();
+    const events = context?.eventTypes || context?.event_types;
+    const start = async () => {
+        try {
+            await initialize();
+        } catch (error) {
+            console.error('[STSC] 插件初始化失败：', error);
+            toastr.error('墨提斯之镜 DEV 插件加载失败，请查看浏览器控制台。');
+        }
+    };
+
+    if (context?.eventSource && events?.APP_READY) {
+        context.eventSource.on(events.APP_READY, start);
+    } else {
+        start();
+    }
+});
