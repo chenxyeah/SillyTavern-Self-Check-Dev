@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.8';
+const STSC_VERSION = '0.4.0-beta.9';
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
 const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
@@ -2217,7 +2217,12 @@ function onGenerationStopped() {
 
 function isOfficialPluginEnabled() {
     const official = ctx()?.extensionSettings?.sillytavern_self_check;
-    return Boolean(official?.enabled);
+    // 扩展管理器停用正式版后，旧的 enabled 设置仍可能保留。
+    // 只有正式版脚本当前确实已加载，且其内部开关仍开启时，才视为真实冲突。
+    const runtimeLoaded = typeof globalThis.sillyTavernSelfCheckInterceptor === 'function'
+        || Boolean(document.getElementById('stsc_extensions_menu_button'))
+        || Boolean(document.getElementById('stsc_manager_overlay'));
+    return Boolean(runtimeLoaded && official?.enabled);
 }
 
 function skipGenerationType(type) {
