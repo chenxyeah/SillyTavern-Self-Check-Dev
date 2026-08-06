@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.13';
+const STSC_VERSION = '0.4.0-beta.14';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -28,12 +28,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-06',
-    title: '修复双API截断解析并补齐复盘线索页',
+    title: '修复插件内更新检查与版本弹窗入口',
     changes: Object.freeze([
-        '双API自检缺少末尾闭合标签时自动补全并继续解析，不再只能显示整段原始XML。',
-        '收紧每题回答长度与输出模板，降低自检内容在末尾被截断的概率。',
-        '悬浮窗新增复盘线索页，可显示上一轮疑似问题和修复建议。',
-        '只有用户勾选的复盘线索会在下一轮同时交给自检API与正文API，并且只执行一次。',
+        '插件内检查更新现在会读取酒馆Git接口返回的 isUpToDate，不再只判断请求是否成功。',
+        '浏览器无法直连GitHub版本JSON时，仍可根据酒馆服务器端Git结果发现远程新提交。',
+        '更新通知点击后改为打开顶部版本弹窗，不再跳转到已经移除的旧版本标签页。',
+        '备用仓库入口修正为DEV测试仓库。',
     ]),
 });
 
@@ -165,6 +165,7 @@ let updateCheckInFlight = false;
 let updatePollTimer = null;
 let updateToast = null;
 let updateAvailableVersion = '';
+let gitUpdateAvailable = false;
 let latestRemoteReleaseInfo = null;
 let updateCheckState = 'idle';
 let updateCheckError = '';
@@ -3209,7 +3210,7 @@ function renderUpdatesTab() {
 }
 
 function renderHeaderUpdateBadge() {
-    const hasUpdate = Boolean(updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0);
+    const hasUpdate = updateCheckState === 'available' || gitUpdateAvailable || Boolean(updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0);
     $('#stscdev_version_button').toggleClass('has-notice', hasUpdate);
 }
 
@@ -4405,7 +4406,7 @@ function bindUiEvents() {
             await updatePluginFromManager();
             return;
         } else if (action === 'open-extension-manager') {
-            openManager('updates');
+            openVersionDialog();
             return;
         } else if (action === 'import-reference') {
             const input = document.getElementById('stscdev_reference_import_file');
@@ -4833,7 +4834,7 @@ function openExtensionManagerForUpdate() {
     setTimeout(() => {
         const retryButton = document.querySelector('#extensions_details');
         if (retryButton) retryButton.click();
-        else window.open('https://github.com/chenxyeah/SillyTavern-Self-Check', '_blank', 'noopener,noreferrer');
+        else window.open('https://github.com/chenxyeah/SillyTavern-Self-Check-Dev', '_blank', 'noopener,noreferrer');
     }, 150);
 }
 
@@ -4935,6 +4936,7 @@ function markInstalledReleaseSeen() {
 
 function clearPluginUpdateNotice() {
     updateAvailableVersion = '';
+    gitUpdateAvailable = false;
     latestRemoteReleaseInfo = null;
     renderHeaderUpdateBadge();
     $('#stscdev_extensions_menu_button').removeClass('stscdev-has-update').find('.stscdev-menu-update-badge').remove();
@@ -4944,10 +4946,11 @@ function clearPluginUpdateNotice() {
     }
 }
 
-function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
+function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnly = false } = {}) {
     updateAvailableVersion = String(remoteVersion || releaseInfo?.version || '').trim();
+    gitUpdateAvailable = Boolean(gitOnly);
     latestRemoteReleaseInfo = releaseInfo || latestRemoteReleaseInfo;
-    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
+    if (!gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
         clearPluginUpdateNotice();
         return;
     }
@@ -4967,7 +4970,7 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
         saveSettings();
     }
 
-    const versionText = ` v${updateAvailableVersion}`;
+    const versionText = updateAvailableVersion ? ` v${updateAvailableVersion}` : '';
     const detail = Array.isArray(releaseInfo?.changes) && releaseInfo.changes.length
         ? ` 更新内容：${releaseInfo.changes.slice(0, 2).join('；')}`
         : '';
@@ -4979,7 +4982,7 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
             extendedTimeOut: 0,
             closeButton: true,
             tapToDismiss: false,
-            onclick: () => openManager('updates'),
+            onclick: () => openVersionDialog(),
             onHidden: () => { updateToast = null; },
         },
     );
@@ -4991,7 +4994,7 @@ async function updatePluginFromManager() {
         toastr.warning('当前还有未保存的修改，请先点击“保存更改”再更新插件。', '墨提斯之镜 DEV');
         return;
     }
-    if (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0) {
+    if (updateCheckState !== 'available' && !gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
         await checkForPluginUpdate({ force: true });
         if (updateCheckState !== 'available') return;
     }
@@ -5023,7 +5026,7 @@ async function updatePluginFromManager() {
             return;
         }
 
-        const installedTargetVersion = updateAvailableVersion;
+        const installedTargetVersion = gitUpdateAvailable ? '' : updateAvailableVersion;
         clearPluginUpdateNotice();
         toastr.success(`已拉取新版本${installedTargetVersion ? ` v${installedTargetVersion}` : ''}，页面即将刷新。`, '插件更新成功', {
             timeOut: 1400,
@@ -5072,11 +5075,12 @@ async function checkForPluginUpdate({ force = false } = {}) {
             .filter(Boolean)
             .sort((a, b) => compareVersions(b, a))[0] || '';
         const semanticVersionHasUpdate = Boolean(remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0);
+        const gitHasUpdate = gitResult.status === 'fulfilled' && gitResult.value?.isUpToDate === false;
 
         latestRemoteReleaseInfo = releaseInfo;
-        if (semanticVersionHasUpdate) {
+        if (semanticVersionHasUpdate || gitHasUpdate) {
             updateCheckState = 'available';
-            showPluginUpdateNotice(remoteVersion, releaseInfo);
+            showPluginUpdateNotice(remoteVersion, releaseInfo, { gitOnly: gitHasUpdate && !semanticVersionHasUpdate });
         } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled' || releaseResult.status === 'fulfilled') {
             updateCheckState = 'latest';
             clearPluginUpdateNotice();
