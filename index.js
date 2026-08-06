@@ -1,12 +1,14 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.12';
+const STSC_VERSION = '0.4.0-beta.13';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
 const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
 const STSC_CHECK_CLOSE_RE = /<\/stscdev_self_check>/i;
+const STSC_REVIEW_OPEN_RE = /<stscdev_previous_review\b[^>]*>/i;
+const STSC_REVIEW_CLOSE_RE = /<\/stscdev_previous_review>/i;
 const STSC_RESPONSE_OPEN_RE = /<stscdev_response\b[^>]*>/i;
 const STSC_RESPONSE_CLOSE_RE = /<\/stscdev_response>/i;
 const STSC_PRESET_EXPORT_FORMAT = 'sillytavern-self-check-preset';
@@ -26,12 +28,12 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-06',
-    title: '六区块界面、版本与运行日志中心',
+    title: '修复双API截断解析并补齐复盘线索页',
     changes: Object.freeze([
-        '管理器固定为六个区块，移动端以两排三列显示。',
-        '版本号和运行日志改为顶部弹窗入口，并支持更新或未读红点。',
-        '通用与角色自检开关只保留在自检预设页，插件设置集中显示总开关和运行状态灯。',
-        '运行错误与解析警告本地保存，支持导出、单条删除和全部清除。',
+        '双API自检缺少末尾闭合标签时自动补全并继续解析，不再只能显示整段原始XML。',
+        '收紧每题回答长度与输出模板，降低自检内容在末尾被截断的概率。',
+        '悬浮窗新增复盘线索页，可显示上一轮疑似问题和修复建议。',
+        '只有用户勾选的复盘线索会在下一轮同时交给自检API与正文API，并且只执行一次。',
     ]),
 });
 
@@ -1748,9 +1750,73 @@ function buildDualApiTemporaryContext(instructions) {
     return instructions.map((instruction, index) => `${index + 1}. 【${instruction.name}】${instruction.content.trim()}`).join('\n');
 }
 
+function getReviewSource(settings = normalizeSettings()) {
+    if (!settings?.dualApi?.previousReview) return null;
+    const latest = getLatestResult();
+    if (!latest || latest.chatId !== getCurrentChatId()) return null;
+    const message = ctx()?.chat?.[Number(latest.messageId)];
+    if (!message || message.is_user || message.is_system) return null;
+    return { latest, output: String(message.mes || '').trim() };
+}
+
+function buildPreviousReviewRequest(settings) {
+    const source = getReviewSource(settings);
+    if (!source) return '';
+    const answers = (source.latest.answers || []).map((item, index) => [
+        `Q${index + 1}：${item.question || ''}`,
+        `A${index + 1}：${item.answer || ''}`,
+        item.evidence ? `依据：${item.evidence}` : '',
+    ].filter(Boolean).join('\n')).join('\n\n');
+    return `
+在回答本轮自检前，先复盘上一轮。只报告有明确文本依据的疑似问题；不要为了填满格式而虚构问题。
+
+【上一轮自检】
+${answers || '（没有可读取的上一轮自检问答）'}
+
+【上一轮实际正文】
+${source.output || '（没有可读取的上一轮正文）'}
+
+复盘必须放在本轮自检之前，格式只能是以下两种之一：
+<stscdev_previous_review><status>ok</status></stscdev_previous_review>
+或
+<stscdev_previous_review><status>warning</status><issue><type>简短类型</type><description>疑似问题</description><evidence>正文中的具体依据</evidence><suggestion>下一轮自然修复建议</suggestion></issue></stscdev_previous_review>
+有多个问题时重复 <issue>；最多3条。复盘之后仍须完整输出 <stscdev_self_check>。
+`.trim();
+}
+
+function parsePreviousReview(text) {
+    const source = String(text || '');
+    const open = STSC_REVIEW_OPEN_RE.exec(source);
+    if (!open) return null;
+    const afterOpen = open.index + open[0].length;
+    const tail = source.slice(afterOpen);
+    const close = STSC_REVIEW_CLOSE_RE.exec(tail);
+    const selfCheck = STSC_CHECK_OPEN_RE.exec(source);
+    const innerEnd = close ? afterOpen + close.index : (selfCheck?.index || source.length);
+    const inner = source.slice(afterOpen, innerEnd);
+    const status = decodeXmlEntities(inner.match(/<status[^>]*>([\s\S]*?)<\/status>/i)?.[1] || '').trim().toLowerCase();
+    const issues = [];
+    const issueRegex = /<issue\b[^>]*>([\s\S]*?)<\/issue>/gi;
+    let match;
+    while ((match = issueRegex.exec(inner)) !== null && issues.length < 3) {
+        const body = match[1];
+        const field = tag => decodeXmlEntities(body.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i'))?.[1] || '').trim();
+        const description = field('description');
+        if (description) issues.push({ id: uid('review'), type: field('type') || '疑似问题', description, evidence: field('evidence'), suggestion: field('suggestion'), selected: false });
+    }
+    return { timestamp: Date.now(), status: issues.length || status === 'warning' ? 'warning' : 'ok', issues };
+}
+
+function selectedRepairDirectives() {
+    const issues = getLatestResult()?.previousReview?.issues || [];
+    return issues.filter(item => item.selected).map(item => item.suggestion || item.description).filter(Boolean);
+}
+
 function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings) {
     const characterContext = getDualApiCharacterContext() || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
     const selectedChat = selectDualApiChat(chat, settings.dualApi);
+    const reviewRequest = buildPreviousReviewRequest(settings);
+    const repairDirectives = selectedRepairDirectives();
     const systemPrompt = `
 [墨提斯之镜 DEV｜独立自检API]
 你是写作前置自检模型。你的唯一任务是为下一步“酒馆主API”完成本轮自检，不得写角色扮演正文、对白、动作描写、状态栏或续写剧情。
@@ -1761,12 +1827,13 @@ function buildDualApiMessages(chat, questions, references, temporaryInstructions
 3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
 4. 不得漏题、合并题目或改变题目ID。
 5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
-6. 只输出下方指定的自检XML，不要输出解释、Markdown代码围栏或正文。
+6. 每个答案只写最终结论，控制在2—5句；不要展开思考过程，避免输出过长而截断。
+7. 只输出下方指定的XML，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
 
 严格输出格式：
 <stscdev_self_check>
-无需依据：<item id="题目ID"><answer>可独立执行的最终回答</answer></item>
-需要依据：<item id="题目ID"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
+<item id="无需依据的题目ID"><answer>可独立执行的最终回答</answer></item>
+<item id="需要依据的题目ID"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
 </stscdev_self_check>
 
 【当前角色资料】
@@ -1777,6 +1844,10 @@ ${buildDualApiReferenceContext(references)}
 
 【本轮启用的快捷指令】
 ${buildDualApiTemporaryContext(temporaryInstructions)}
+
+${repairDirectives.length ? `【用户确认的本轮修复方向】\n${repairDirectives.map((item, index) => `${index + 1}. ${item}`).join('\n')}\n修复必须承认上一轮已经发生，不得生硬重置剧情。` : ''}
+
+${reviewRequest}
 `.trim();
 
     const answerStyleInstruction = settings.dualApi.transformFormat
@@ -1944,9 +2015,13 @@ ${rules}
 
 function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
     const transform = Boolean(settings.dualApi.transformFormat);
-    const text = transform
+    let text = transform
         ? buildDualApiContractInjection(questions, parsed)
         : buildDualApiRawInjection(questions, parsed);
+    const repairs = selectedRepairDirectives();
+    if (repairs.length) {
+        text += `\n\n<stscdev_repair_directives>\n以下是用户确认需要在本轮自然修复的问题。必须承认已经发生的剧情，不得重写或生硬重置上一轮。\n${repairs.map(item => `<repair>${wrapXmlCdata(item)}</repair>`).join('\n')}\n</stscdev_repair_directives>`;
+    }
 
     if (!text) {
         clearRuntimePrompt('stscdev_dual_main');
@@ -2036,7 +2111,7 @@ function extractVisibleBody(text) {
 }
 
 function parseModelOutput(text, expectedQuestions = []) {
-    const source = String(text ?? '');
+    const source = String(text ?? '').replace(/^\s*```(?:xml)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
     const openMatch = STSC_CHECK_OPEN_RE.exec(source);
     const closeMatch = STSC_CHECK_CLOSE_RE.exec(source);
     const result = {
@@ -2046,6 +2121,7 @@ function parseModelOutput(text, expectedQuestions = []) {
         body: extractVisibleBody(source),
         items: [],
         answers: [],
+        repaired: false,
     };
 
     if (!openMatch) {
@@ -2053,14 +2129,14 @@ function parseModelOutput(text, expectedQuestions = []) {
         return result;
     }
 
-    if (!closeMatch || closeMatch.index < openMatch.index) {
-        result.status = 'format_error';
-        result.formatIssues.push('自检标签没有正确闭合。');
-        return result;
-    }
-
     const innerStart = openMatch.index + openMatch[0].length;
-    const inner = source.slice(innerStart, closeMatch.index).trim();
+    const hasUsableClose = Boolean(closeMatch && closeMatch.index >= openMatch.index);
+    const innerEnd = hasUsableClose ? closeMatch.index : source.length;
+    const inner = source.slice(innerStart, innerEnd).trim();
+    if (!hasUsableClose) {
+        result.repaired = true;
+        result.formatIssues.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+    }
     result.rawCheck = inner;
     result.items = parseItems(inner);
     // 仅精准移除 <stscdev_self_check>…</stscdev_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
@@ -2096,7 +2172,8 @@ function parseModelOutput(text, expectedQuestions = []) {
         result.formatIssues.push(`应回答 ${expectedQuestions.length} 题，实际识别到 ${result.items.length} 题。`);
     }
 
-    result.status = result.formatIssues.length ? 'format_error' : 'ok';
+    const substantiveIssues = result.formatIssues.filter(issue => !issue.includes('插件已按返回文本末尾自动补全'));
+    result.status = substantiveIssues.length ? 'format_error' : (result.repaired ? 'recovered' : 'ok');
     return result;
 }
 
@@ -2162,6 +2239,7 @@ function statusText(status) {
         missing: '本轮AI未输出自检问答',
         strict_ok: '双阶段自检已完成',
         dual_ok: '双API自检已完成',
+        recovered: '自检格式已自动修复',
     }[status] || '暂无状态';
 }
 
@@ -2170,13 +2248,14 @@ function statusIcon(status) {
         ok: '✓',
         strict_ok: '✓',
         dual_ok: '✓',
+        recovered: '✓',
         format_error: '⚠',
         missing: '!',
     }[status] || '○';
 }
 
 function statusClass(status) {
-    if (status === 'ok' || status === 'strict_ok' || status === 'dual_ok') return 'stscdev-status-ok';
+    if (status === 'ok' || status === 'strict_ok' || status === 'dual_ok' || status === 'recovered') return 'stscdev-status-ok';
     if (status === 'format_error') return 'stscdev-status-warning';
     if (status === 'missing') return 'stscdev-status-error';
     return '';
@@ -2213,7 +2292,7 @@ async function handleMessageReceived(data) {
         updateMessageText(message, body);
 
         const checkParsed = run.dualParsed || parseModelOutput(run.dualCheck, questions);
-        const dualStatus = checkParsed.status === 'ok' ? 'dual_ok' : 'format_error';
+        const dualStatus = checkParsed.status === 'ok' ? 'dual_ok' : checkParsed.status;
         latest = makeLatestResult({
             parsed: checkParsed,
             questions,
@@ -2222,6 +2301,7 @@ async function handleMessageReceived(data) {
             rawOverride: checkParsed.rawCheck || run.dualCheck,
             statusOverride: dualStatus,
         });
+        latest.previousReview = run.previousReview || null;
         if (mainParsed.status !== 'missing') {
             latest.formatIssues.push('酒馆主API意外重复输出了自检内容，插件已自动移除。');
             if (latest.status === 'dual_ok') latest.status = 'format_error';
@@ -2236,6 +2316,9 @@ async function handleMessageReceived(data) {
     await saveLatestResult(latest);
     if (latest.formatIssues?.length) {
         addRuntimeLog('warning', '自检解析', latest.formatIssues.join('；'), `本轮已识别 ${latest.answeredCount}/${latest.expectedCount} 题；异常内容已在当前状态中标记。`);
+    }
+    if (latest.previousReview?.issues?.length) {
+        addRuntimeLog('info', 'AI复盘', `发现 ${latest.previousReview.issues.length} 条上一轮疑似问题。`, '已保存到“复盘线索”；只有用户勾选的内容才会影响下一轮。');
     }
 
     try {
@@ -2325,6 +2408,7 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
         generationType: type,
         dualCheck: '',
         dualParsed: null,
+        previousReview: null,
         targetMessageFloor,
     };
 
@@ -2347,12 +2431,14 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
                 settings,
             });
             const dualParsed = parseModelOutput(rawCheck, dualQuestions);
+            const previousReview = parsePreviousReview(rawCheck);
             if (dualParsed.status === 'missing') {
                 dualParsed.status = 'format_error';
                 dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stscdev_self_check> 结构。');
             }
             pendingRun.dualCheck = rawCheck;
             pendingRun.dualParsed = dualParsed;
+            pendingRun.previousReview = previousReview;
             pendingRun.mode = 'dual_api';
             applyDualApiMainPrompt(dualQuestions, dualParsed, rawCheck, settings);
             if (dualParsed.status !== 'ok') {
@@ -3230,6 +3316,35 @@ function renderFloatingCheckPage() {
     $('#stscdev_floating_content').html(`${issues}${answers}`);
 }
 
+function renderFloatingReviewPage() {
+    const settings = normalizeSettings();
+    const review = getLatestResult()?.previousReview || null;
+    $('#stscdev_floating_title').text('复盘线索');
+    if (settings.mode !== 'dual_api' || !settings.dualApi.previousReview) {
+        $('#stscdev_floating_subtitle').text('当前未启用');
+        $('#stscdev_floating_content').html('<div class="stscdev-empty"><b>上一轮复盘未开启</b><br><br>前往“插件设置 → 双API增强”开启。复盘仅在双API模式下运行。</div>');
+        return;
+    }
+    if (!review) {
+        $('#stscdev_floating_subtitle').text('等待第一份复盘结果');
+        $('#stscdev_floating_content').html('<div class="stscdev-empty">暂无可复盘内容。完成至少两轮双API正文生成后，这里会显示上一轮检查结果。</div>');
+        return;
+    }
+    $('#stscdev_floating_subtitle').text(new Date(review.timestamp).toLocaleString());
+    if (review.status === 'ok' || !review.issues?.length) {
+        $('#stscdev_floating_content').html('<div class="stscdev-empty stscdev-review-ok"><b>✓ 上一轮未发现明显问题</b></div>');
+        return;
+    }
+    const cards = review.issues.map(issue => `<article class="stscdev-review-card">
+        <div class="stscdev-review-type">${escapeHtml(issue.type || '疑似问题')}</div>
+        <div class="stscdev-review-description">${escapeHtml(issue.description || '')}</div>
+        ${issue.evidence ? `<div class="stscdev-review-detail"><b>依据：</b>${escapeHtml(issue.evidence)}</div>` : ''}
+        ${issue.suggestion ? `<div class="stscdev-review-detail"><b>修复建议：</b>${escapeHtml(issue.suggestion)}</div>` : ''}
+        <label class="checkbox_label stscdev-review-select"><input type="checkbox" data-review-issue-id="${escapeHtml(issue.id)}" ${issue.selected ? 'checked' : ''}> 下轮修复</label>
+    </article>`).join('');
+    $('#stscdev_floating_content').html(`<div class="stscdev-muted stscdev-review-note">复盘是AI判断的疑似问题。只有你勾选的线索才会影响下一轮，且只执行一次。</div><div class="stscdev-review-list">${cards}</div>`);
+}
+
 function renderFloating() {
     const settings = getUiSettings();
     const $root = $('#stscdev_floating_root');
@@ -3254,11 +3369,13 @@ function renderFloating() {
 
     if (floatingPanelPage === 'instructions') {
         renderFloatingInstructionPage();
+    } else if (floatingPanelPage === 'review') {
+        renderFloatingReviewPage();
     } else {
         renderFloatingCheckPage();
     }
 
-    $('#stscdev_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : '打开完整管理器');
+    $('#stscdev_floating_open_manager').text(floatingPanelPage === 'instructions' ? '打开指令管理器' : floatingPanelPage === 'review' ? '打开插件设置' : '打开完整管理器');
     const panelOpen = !$('#stscdev_floating_panel').hasClass('stscdev-hidden');
     if (panelOpen) requestAnimationFrame(layoutFloatingPanel);
     if (panelOpen && floatingPanelPage === 'check') void markLatestIssueViewed();
@@ -3923,11 +4040,12 @@ function bindUiEvents() {
         event.preventDefault();
         event.stopPropagation();
         toggleFloatingPanel(false);
-        openManager(floatingPanelPage === 'instructions' ? 'temporary' : 'status');
+        openManager(floatingPanelPage === 'instructions' ? 'temporary' : floatingPanelPage === 'review' ? 'settings' : 'status');
     });
     $('#stscdev_floating_panel').on('click', '[data-floating-page]', function (event) {
         event.preventDefault();
-        const nextPage = $(this).data('floating-page') === 'instructions' ? 'instructions' : 'check';
+        const requestedPage = String($(this).data('floating-page') || 'check');
+        const nextPage = ['check', 'instructions', 'review'].includes(requestedPage) ? requestedPage : 'check';
         if (floatingPanelPage === nextPage) return;
         floatingPanelPage = nextPage;
         renderFloating();
@@ -4175,6 +4293,14 @@ function bindUiEvents() {
         markDirty();
         renderSettingsTab();
         updateSaveState();
+    });
+    $('#stscdev_floating_panel').on('change', '[data-review-issue-id]', async function () {
+        const latest = getLatestResult();
+        const issue = latest?.previousReview?.issues?.find(item => item.id === String($(this).data('review-issue-id') || ''));
+        if (!issue) return;
+        issue.selected = this.checked;
+        await saveLatestResult(latest);
+        renderFloatingReviewPage();
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_previous_review', function () {
         getUiSettings().dualApi.previousReview = this.checked;

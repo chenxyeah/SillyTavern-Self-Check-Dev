@@ -1810,7 +1810,7 @@ body.stscdev-modal-open {
 .stscdev-floating-tabs {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 5px;
   padding: 7px 9px;
   border-bottom: 1px solid var(--stscdev-border);
@@ -2108,6 +2108,15 @@ body.stscdev-modal-open {
   cursor: pointer;
   background: transparent;
 }
+
+.stscdev-review-list { display: flex; flex-direction: column; gap: 9px; margin-top: 9px; }
+.stscdev-review-card { padding: 11px; border: 1px solid var(--stscdev-border); border-left: 4px solid #dca642; border-radius: 10px; background: color-mix(in srgb, var(--stscdev-panel) 90%, transparent); }
+.stscdev-review-type { color: #e8b64f; font-weight: 700; margin-bottom: 6px; }
+.stscdev-review-description { line-height: 1.55; }
+.stscdev-review-detail { margin-top: 7px; color: var(--stscdev-muted-text); line-height: 1.5; }
+.stscdev-review-select { margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--stscdev-border); }
+.stscdev-review-note { padding: 9px; border-radius: 8px; background: var(--stscdev-soft); }
+.stscdev-review-ok { color: #55c985; }
 
 .stscdev-header-log-button { position: relative; white-space: nowrap; }
 .stscdev-header-dot { display: none; position: absolute; right: -3px; top: -3px; width: 9px; height: 9px; border: 2px solid var(--stscdev-panel); border-radius: 50%; background: #ef4444; box-sizing: content-box; }
