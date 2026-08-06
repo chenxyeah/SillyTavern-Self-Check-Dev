@@ -2,10 +2,11 @@
   <div class="stscdev-manager" role="dialog" aria-modal="true" aria-label="墨提斯之镜 DEV 管理器">
     <div class="stscdev-manager-header">
       <div class="stscdev-manager-heading">
-        <div class="stscdev-manager-title">墨提斯之镜 · DEV <span class="stscdev-manager-version">v0.4.0-beta.11</span></div>
+        <div class="stscdev-manager-title">墨提斯之镜 · DEV <button id="stscdev_version_button" class="stscdev-manager-version" type="button" title="查看版本信息">v0.4.0-beta.12<span class="stscdev-header-dot" aria-hidden="true"></span></button></div>
         <div id="stscdev_manager_subtitle" class="stscdev-manager-subtitle"></div>
       </div>
       <div class="stscdev-header-actions">
+        <button id="stscdev_log_button" class="menu_button stscdev-header-log-button" type="button">运行日志<span class="stscdev-header-dot" aria-hidden="true"></span></button>
         <span id="stscdev_save_state" class="stscdev-save-state">已保存</span>
         <button id="stscdev_save_changes" class="menu_button stscdev-save-button" type="button" disabled>保存更改</button>
         <button id="stscdev_close_manager" class="menu_button stscdev-icon-button" type="button" title="关闭" aria-label="关闭">✕</button>
@@ -18,7 +19,7 @@
       <button class="stscdev-tab" type="button" data-tab="references">参考资料库</button>
       <button class="stscdev-tab" type="button" data-tab="temporary">快捷指令</button>
       <button class="stscdev-tab" type="button" data-tab="settings">插件设置</button>
-      <button class="stscdev-tab" type="button" data-tab="updates">版本更新</button>
+      <button class="stscdev-tab" type="button" data-tab="appearance">界面显示</button>
     </div>
 
     <div class="stscdev-manager-body">
@@ -27,7 +28,8 @@
       <section id="stscdev_tab_references" class="stscdev-tab-panel"></section>
       <section id="stscdev_tab_temporary" class="stscdev-tab-panel"></section>
       <section id="stscdev_tab_settings" class="stscdev-tab-panel"></section>
-      <section id="stscdev_tab_updates" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_appearance" class="stscdev-tab-panel"></section>
+      <section id="stscdev_tab_updates" class="stscdev-hidden" aria-hidden="true"></section>
     </div>
   </div>
 </div>

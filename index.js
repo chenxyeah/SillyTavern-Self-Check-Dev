@@ -1,7 +1,8 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.11';
+const STSC_VERSION = '0.4.0-beta.12';
+const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
 const STSC_CHECK_OPEN_RE = /<stscdev_self_check\b[^>]*>/i;
@@ -24,13 +25,13 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-08-05',
-    title: '修复强力规范中的格式标签重复转义',
+    releasedAt: '2026-08-06',
+    title: '六区块界面、版本与运行日志中心',
     changes: Object.freeze([
-        '修复独立自检API已将 <status_top>、<status_bottom> 等标签转成 &lt;...&gt; 后，强力规范再次转义为 &amp;lt;...&amp;gt; 的问题。',
-        '自检答案与依据现在会先还原已有的 XML/HTML 实体，再在执行协议中统一只转义一次。',
-        '主API最终会收到清晰的 &lt;status_top&gt; 一层实体，不再出现双重转义；原始聊天记录与用户资料不会被修改。',
-        '双API调用、强力规范结构、遗漏项跳过、模型获取与正式版冲突检测均保持不变。',
+        '管理器固定为六个区块，移动端以两排三列显示。',
+        '版本号和运行日志改为顶部弹窗入口，并支持更新或未读红点。',
+        '通用与角色自检开关只保留在自检预设页，插件设置集中显示总开关和运行状态灯。',
+        '运行错误与解析警告本地保存，支持导出、单条删除和全部清除。',
     ]),
 });
 
@@ -97,7 +98,10 @@ const DEFAULT_SETTINGS = Object.freeze({
         customTurns: 5,
         transformFormat: false,
         failureMode: 'fallback_single',
+        previousReview: false,
     },
+    logs: [],
+    logLastViewedAt: 0,
     presets: [],
     references: [],
     temporaryInstructions: [],
@@ -169,6 +173,22 @@ let dualApiModelsLoading = false;
 let dualApiModelsError = '';
 let dualApiModelsSignature = '';
 let dualApiModelFetchTimer = null;
+
+function sanitizeLogText(value) {
+    return String(value ?? '')
+        .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [已隐藏]')
+        .replace(/\bsk-[A-Za-z0-9_-]{8,}\b/gi, '[API密钥已隐藏]')
+        .slice(0, 6000);
+}
+
+function addRuntimeLog(level, stage, message, handling = '') {
+    const settings = normalizeSettings();
+    if (!settings) return;
+    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(message), handling: sanitizeLogText(handling) });
+    settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
+    saveSettings();
+    renderLogBadge();
+}
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.();
@@ -248,6 +268,10 @@ function normalizeSettings() {
     settings.dualApi.customTurns = clampNumber(settings.dualApi.customTurns, 1, 100, 5);
     settings.dualApi.transformFormat = Boolean(settings.dualApi.transformFormat);
     settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
+    settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
+    if (!Array.isArray(settings.logs)) settings.logs = [];
+    settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
+    settings.logLastViewedAt = Math.max(0, Number(settings.logLastViewedAt) || 0);
 
     if (!Array.isArray(settings.presets)) settings.presets = [];
     if (!Array.isArray(settings.references)) settings.references = [];
@@ -353,6 +377,7 @@ function normalizeSettings() {
     if (initialGeneral?.name === '通用自检预设') initialGeneral.name = '默认（初始默认）';
 
     settings.ui.presetSection = settings.ui.presetSection === 'character' ? 'character' : 'general';
+    settings.ui.activeTab = ['status', 'presets', 'references', 'temporary', 'settings', 'appearance'].includes(settings.ui.activeTab) ? settings.ui.activeTab : 'status';
     const oldEditing = settings.presets.find(x => x.id === settings.ui.editingPresetId);
     if (!settings.ui.editingGeneralPresetId && oldEditing?.kind === 'general') settings.ui.editingGeneralPresetId = oldEditing.id;
     if (!settings.ui.editingCharacterPresetId && oldEditing?.kind === 'character') settings.ui.editingCharacterPresetId = oldEditing.id;
@@ -2209,6 +2234,9 @@ async function handleMessageReceived(data) {
 
     refreshMessageDom(messageId, message);
     await saveLatestResult(latest);
+    if (latest.formatIssues?.length) {
+        addRuntimeLog('warning', '自检解析', latest.formatIssues.join('；'), `本轮已识别 ${latest.answeredCount}/${latest.expectedCount} 题；异常内容已在当前状态中标记。`);
+    }
 
     try {
         await context.saveChat?.();
@@ -2334,11 +2362,13 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
             console.error('[STSC DEV] 双API自检调用失败：', error);
             const reason = dualApiFailureMessage(error);
             if (settings.dualApi.failureMode === 'fallback_single') {
+                addRuntimeLog('warning', '自检API', reason, '已自动退回单API调用。');
                 pendingRun.mode = 'single';
                 pendingRun.questions = clone(questions);
                 setRuntimePrompt('stscdev_main', buildSinglePrompt(questions), settings.injection);
                 toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜 DEV', { timeOut: 9000 });
             } else {
+                addRuntimeLog('error', '自检API', reason, '已停止本轮生成。');
                 abort?.(true);
                 pendingRun = null;
                 clearRuntimePrompts();
@@ -2601,6 +2631,14 @@ function renderPresetsTab() {
     }
 
     $('#stscdev_tab_presets').html(`
+        <div class="stscdev-section stscdev-preset-master-switches">
+            <div class="stscdev-section-title">自检启用状态</div>
+            <div class="stscdev-status-switch-grid">
+                <label class="checkbox_label"><span class="stscdev-signal ${settings.generalEnabled ? 'is-on' : 'is-off'}"></span><input id="stscdev_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 通用自检${settings.generalEnabled ? '已启用' : '未启用'}</label>
+                <label class="checkbox_label"><span class="stscdev-signal ${settings.characterEnabled ? 'is-on' : 'is-off'}"></span><input id="stscdev_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 角色自检${settings.characterEnabled ? '已启用' : '未启用'}</label>
+            </div>
+            <div class="stscdev-muted">通用与角色自检只在这里启用；插件总开关位于“插件设置”。</div>
+        </div>
         <div class="stscdev-preset-subtabs" role="tablist" aria-label="预设类型">
             <button type="button" class="stscdev-preset-subtab ${kind === 'general' ? 'active' : ''}" data-preset-section="general">通用预设</button>
             <button type="button" class="stscdev-preset-subtab ${kind === 'character' ? 'active' : ''}" data-preset-section="character">角色预设</button>
@@ -2818,9 +2856,20 @@ function renderSettingsTab() {
     const modelOptions = dualApiModelOptionsHtml(dual);
     $('#stscdev_tab_settings').html(`
         <div class="stscdev-section">
+            <div class="stscdev-section-title">运行状态</div>
+            <div class="stscdev-status-lights">
+                <span><i class="stscdev-signal ${settings.enabled ? 'is-on' : 'is-off'}"></i>插件${settings.enabled ? '已启用' : '未启用'}</span>
+                <span><i class="stscdev-signal ${settings.generalEnabled ? 'is-on' : 'is-off'}"></i>通用自检${settings.generalEnabled ? '已启用' : '未启用'}</span>
+                <span><i class="stscdev-signal ${settings.characterEnabled ? 'is-on' : 'is-off'}"></i>角色自检${settings.characterEnabled ? '已启用' : '未启用'}</span>
+                <span><i class="stscdev-signal ${settings.mode === 'dual_api' ? (dualApiModelsError ? 'is-off' : 'is-on') : 'is-na'}"></i>${settings.mode === 'dual_api' ? '双API模式' : '单API模式'}</span>
+                <span><i class="stscdev-signal ${settings.mode === 'dual_api' ? (dual.transformFormat ? 'is-on' : 'is-off') : 'is-na'}"></i>强力规范转化</span>
+                <span><i class="stscdev-signal ${settings.mode === 'dual_api' ? (dual.previousReview ? 'is-on' : 'is-off') : 'is-na'}"></i>上一轮复盘</span>
+            </div>
+        </div>
+        <div class="stscdev-section">
             <div class="stscdev-section-title">运行方式</div>
             <label class="checkbox_label"><input id="stscdev_setting_enabled" type="checkbox" ${settings.enabled ? 'checked' : ''}> 启用插件</label>
-            <div class="stscdev-grid-2" style="margin-top:10px">
+            <div style="margin-top:10px">
                 <div class="stscdev-field"><label>生成模式</label><select id="stscdev_setting_mode" class="text_pole">
                     <option value="single" ${settings.mode === 'single' ? 'selected' : ''}>单API调用：自检与正文一次生成（现有模式）</option>
                     <option value="dual_api" ${settings.mode === 'dual_api' ? 'selected' : ''}>双API调用：插件API自检，酒馆主API写正文（DEV）</option>
@@ -2829,10 +2878,6 @@ function renderSettingsTab() {
                     ${settings.mode === 'single' ? '当前模式不变：由酒馆主API在同一次回复中完成自检和正文。' : ''}
                     ${settings.mode === 'dual_api' ? '插件API只负责回答自检；结果会在下一阶段交给酒馆主API生成正文。' : ''}
                 </div></div>
-                <div class="stscdev-field"><label>预设叠加</label>
-                    <label class="checkbox_label"><input id="stscdev_general_enabled" type="checkbox" ${settings.generalEnabled ? 'checked' : ''}> 启用通用预设</label>
-                    <label class="checkbox_label"><input id="stscdev_character_enabled" type="checkbox" ${settings.characterEnabled ? 'checked' : ''}> 启用角色专属预设</label>
-                </div>
             </div>
             <div class="stscdev-dual-branch-card" style="margin-top:12px">
                 <div class="stscdev-dual-branch-grid">
@@ -2930,6 +2975,11 @@ function renderSettingsTab() {
                     </div>
                 </div>
                 <div class="stscdev-muted" style="margin-top:8px">无论选择哪一种，自检与规范都只用于本轮，不写入正式聊天记录。</div>
+                <label class="checkbox_label stscdev-strong-checkbox" style="margin-top:12px">
+                    <input id="stscdev_previous_review" type="checkbox" ${dual.previousReview ? 'checked' : ''}>
+                    开启上一轮复盘
+                </label>
+                <div class="stscdev-muted">仅双API支持；检查上一轮自检与正文的疑似偏差。复盘结果只作为线索，不会自动修改剧情。</div>
             </div>
 
             <div class="stscdev-grid-2" style="margin-top:12px">
@@ -2965,36 +3015,6 @@ function renderSettingsTab() {
             </div>
         </div>
         <div class="stscdev-section">
-            <div class="stscdev-section-title">界面显示</div>
-            <div class="stscdev-grid-2">
-                <div class="stscdev-field"><label>插件配色</label><select id="stscdev_theme" class="text_pole">
-                    <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
-                    <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option>
-                    <option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
-                    <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option>
-                    <option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option>
-                    <option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
-                </select></div>
-                <div class="stscdev-field"><label>悬浮窗</label>
-                    <label class="checkbox_label"><input id="stscdev_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 开启悬浮按钮，查看自检问答并快速启用指令</label>
-                    <div class="stscdev-muted">悬浮按钮支持鼠标或手指拖动，并会记住位置；悬浮窗包含“自检问答”和“快捷指令”两个页面。</div>
-                </div>
-            </div>
-            <div class="stscdev-floating-customizer">
-                <div class="stscdev-field"><label>悬浮窗样式</label><select id="stscdev_floating_style" class="text_pole">
-                    <option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option>
-                    <option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option>
-                    <option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option>
-                    <option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option>
-                </select></div>
-                <div class="stscdev-field stscdev-range-field"><label>悬浮按钮透明度 <span id="stscdev_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stscdev_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"><div class="stscdev-muted">只调整圆形悬浮按钮的背景透明度，不影响打开后的悬浮窗内容。</div></div>
-                <div class="stscdev-field stscdev-range-field"><label>悬浮按钮大小 <span id="stscdev_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stscdev_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"><div class="stscdev-muted">最大为原来的按钮大小，向左可缩小两档以上；图标、红点和拖动范围会同步适配。</div></div>
-                <div class="stscdev-field stscdev-range-field"><label>悬浮窗宽度 <span id="stscdev_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stscdev_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
-                <div class="stscdev-field stscdev-range-field"><label>悬浮窗高度 <span id="stscdev_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stscdev_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
-            </div>
-            <div class="stscdev-muted" style="margin-top:8px">移动端会在安全区域内自动限制最大尺寸；调整设置时，已打开的悬浮窗会即时预览。</div>
-        </div>
-        <div class="stscdev-section">
             <div class="stscdev-section-title">上下文处理</div>
             <div>插件不会在流式生成期间添加整段遮罩。建议使用 README 中提供的正则，仅隐藏 &lt;stscdev_self_check&gt; 标签内的自检内容。</div>
             <div>生成完成后，插件会提取自检并从聊天正文中剥离；聊天记录只保留正文、状态栏和其他正常输出，下一轮AI读取不到上一轮自检。</div>
@@ -3012,6 +3032,36 @@ function renderSettingsTab() {
             }
         }, 0);
     }
+}
+
+function renderAppearanceTab() {
+    const settings = getUiSettings();
+    $('#stscdev_tab_appearance').html(`
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">主题与颜色</div>
+            <div class="stscdev-field"><label>插件配色</label><select id="stscdev_theme" class="text_pole">
+                <option value="default" ${settings.appearance.theme === 'default' ? 'selected' : ''}>默认：跟随 SillyTavern 美化</option>
+                <option value="rose" ${settings.appearance.theme === 'rose' ? 'selected' : ''}>樱雾粉</option><option value="blue" ${settings.appearance.theme === 'blue' ? 'selected' : ''}>月光蓝</option>
+                <option value="mint" ${settings.appearance.theme === 'mint' ? 'selected' : ''}>青瓷绿</option><option value="violet" ${settings.appearance.theme === 'violet' ? 'selected' : ''}>暮藤紫</option><option value="gold" ${settings.appearance.theme === 'gold' ? 'selected' : ''}>奶杏金</option>
+            </select></div>
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">悬浮按钮</div>
+            <label class="checkbox_label"><span class="stscdev-signal ${settings.appearance.floatingEnabled ? 'is-on' : 'is-off'}"></span><input id="stscdev_floating_enabled" type="checkbox" ${settings.appearance.floatingEnabled ? 'checked' : ''}> 显示悬浮按钮</label>
+            <div class="stscdev-floating-customizer">
+                <div class="stscdev-field stscdev-range-field"><label>透明度 <span id="stscdev_floating_opacity_value">${Math.round(settings.appearance.floatingOpacity * 100)}%</span></label><input id="stscdev_floating_opacity" type="range" min="10" max="100" step="1" value="${Math.round(settings.appearance.floatingOpacity * 100)}"></div>
+                <div class="stscdev-field stscdev-range-field"><label>按钮大小 <span id="stscdev_floating_button_size_value">${Math.round(settings.appearance.floatingButtonSize)}px</span></label><input id="stscdev_floating_button_size" type="range" min="34" max="50" step="2" value="${Math.round(settings.appearance.floatingButtonSize)}"></div>
+            </div>
+        </div>
+        <div class="stscdev-section">
+            <div class="stscdev-section-title">悬浮窗口</div>
+            <div class="stscdev-floating-customizer">
+                <div class="stscdev-field"><label>样式</label><select id="stscdev_floating_style" class="text_pole"><option value="theme" ${settings.appearance.floatingStyle === 'theme' ? 'selected' : ''}>跟随插件主题</option><option value="glass" ${settings.appearance.floatingStyle === 'glass' ? 'selected' : ''}>磨砂玻璃</option><option value="solid" ${settings.appearance.floatingStyle === 'solid' ? 'selected' : ''}>纯色卡片</option><option value="minimal" ${settings.appearance.floatingStyle === 'minimal' ? 'selected' : ''}>轻量极简</option></select></div>
+                <div class="stscdev-field stscdev-range-field"><label>宽度 <span id="stscdev_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stscdev_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
+                <div class="stscdev-field stscdev-range-field"><label>高度 <span id="stscdev_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stscdev_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
+            </div>
+            <div class="stscdev-muted">移动端会自动限制在安全区域内；悬浮按钮位置会持续保存。</div>
+        </div>`);
 }
 
 
@@ -3070,6 +3120,49 @@ function renderUpdatesTab() {
             <div class="stscdev-muted" style="margin-top:6px">没有新版本时不会弹窗。发现更新后可直接在本页面完成更新，更新说明可随时回来查看。</div>
         </div>
     `);
+}
+
+function renderHeaderUpdateBadge() {
+    const hasUpdate = Boolean(updateAvailableVersion && compareVersions(updateAvailableVersion, STSC_VERSION) > 0);
+    $('#stscdev_version_button').toggleClass('has-notice', hasUpdate);
+}
+
+function renderLogBadge() {
+    const settings = normalizeSettings();
+    const unread = settings?.logs?.some(item => Number(item.timestamp) > settings.logLastViewedAt && ['error', 'warning'].includes(item.level));
+    $('#stscdev_log_button').toggleClass('has-notice', Boolean(unread));
+}
+
+function openVersionDialog() {
+    renderUpdatesTab();
+    openDialog('版本更新', $('#stscdev_tab_updates').html(), '<button class="menu_button" type="button" data-dialog-action="cancel">关闭</button>');
+}
+
+function runtimeLogHtml(item) {
+    const labels = { error: '错误', warning: '警告', info: '记录' };
+    return `<article class="stscdev-log-item is-${escapeHtml(item.level || 'info')}" data-log-id="${escapeHtml(item.id)}">
+        <div class="stscdev-log-head"><b>${escapeHtml(labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
+        <div>${escapeHtml(item.message || '')}</div>${item.handling ? `<div class="stscdev-muted">处理：${escapeHtml(item.handling)}</div>` : ''}
+        <button class="menu_button stscdev-small-button" type="button" data-dialog-action="delete-log" data-log-id="${escapeHtml(item.id)}">删除</button>
+    </article>`;
+}
+
+function openLogDialog() {
+    const settings = normalizeSettings();
+    settings.logLastViewedAt = Date.now();
+    saveSettings();
+    renderLogBadge();
+    const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stscdev-empty">运行正常，暂无异常记录。</div>';
+    openDialog('运行日志', `<div class="stscdev-log-summary">本地长期保存，最多保留最近 ${STSC_LOG_LIMIT} 条；不会记录 API 密钥。</div><div class="stscdev-log-list">${list}</div>`,
+        '<button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button stscdev-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
+}
+
+function exportRuntimeLogs() {
+    const payload = JSON.stringify({ exportedAt: new Date().toISOString(), version: STSC_VERSION, logs: normalizeSettings().logs }, null, 2);
+    const url = URL.createObjectURL(new Blob([payload], { type: 'application/json;charset=utf-8' }));
+    const anchor = document.createElement('a');
+    anchor.href = url; anchor.download = `墨提斯之镜-运行日志-${new Date().toISOString().slice(0, 10)}.json`; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 function renderFloatingInstructionPage() {
@@ -3181,7 +3274,10 @@ function renderAll() {
     renderReferencesTab();
     renderTemporaryTab();
     renderSettingsTab();
+    renderAppearanceTab();
     renderUpdatesTab();
+    renderHeaderUpdateBadge();
+    renderLogBadge();
     renderFloating();
     applyTheme(getUiSettings());
     updateSaveState();
@@ -3802,6 +3898,8 @@ ${questionText}
 
 function bindUiEvents() {
     $('#stscdev_close_manager').on('click', closeManager);
+    $('#stscdev_version_button').on('click', openVersionDialog);
+    $('#stscdev_log_button').on('click', openLogDialog);
     $('#stscdev_save_changes').on('click', () => commitEditDraft());
     $('#stscdev_floating_button').on('click', function (event) {
         event.preventDefault();
@@ -4074,6 +4172,12 @@ function bindUiEvents() {
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_dual_transform_format', function () {
         getUiSettings().dualApi.transformFormat = this.checked;
+        markDirty();
+        renderSettingsTab();
+        updateSaveState();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_previous_review', function () {
+        getUiSettings().dualApi.previousReview = this.checked;
         markDirty();
         renderSettingsTab();
         updateSaveState();
@@ -4432,6 +4536,43 @@ function bindUiEvents() {
             closeDialog();
             return;
         }
+        if (action === 'check-plugin-update') {
+            void checkForPluginUpdate({ force: true }).then(openVersionDialog);
+            return;
+        }
+        if (action === 'update-plugin-now') {
+            void updatePluginFromManager();
+            return;
+        }
+        if (action === 'export-logs') {
+            exportRuntimeLogs();
+            return;
+        }
+        if (action === 'clear-runtime-cache') {
+            dualApiModels = [];
+            dualApiModelsError = '';
+            dualApiModelsSignature = '';
+            latestRemoteReleaseInfo = null;
+            toastr.success('模型列表与更新检查缓存已清理；预设、资料库和日志未受影响。', '墨提斯之镜 DEV');
+            return;
+        }
+        if (action === 'delete-log') {
+            const id = String($(this).data('log-id') || '');
+            normalizeSettings().logs = normalizeSettings().logs.filter(item => item.id !== id);
+            saveSettings(); openLogDialog();
+            return;
+        }
+        if (action === 'ask-clear-logs') {
+            openDialog('清除运行日志', '<div class="stscdev-delete-warning"><b>确定清除全部运行日志吗？</b><div class="stscdev-muted">该操作无法撤销。</div></div>', '<button class="menu_button" type="button" data-dialog-action="cancel">取消</button><button class="menu_button stscdev-danger-button" type="button" data-dialog-action="confirm-clear-logs">确认清除</button>');
+            return;
+        }
+        if (action === 'confirm-clear-logs') {
+            normalizeSettings().logs = [];
+            normalizeSettings().logLastViewedAt = Date.now();
+            saveSettings(); closeDialog(); renderLogBadge();
+            toastr.success('运行日志已清除。', '墨提斯之镜 DEV');
+            return;
+        }
         if (action === 'confirm-delete') {
             const request = pendingDeleteRequest;
             pendingDeleteRequest = null;
@@ -4669,6 +4810,7 @@ function markInstalledReleaseSeen() {
 function clearPluginUpdateNotice() {
     updateAvailableVersion = '';
     latestRemoteReleaseInfo = null;
+    renderHeaderUpdateBadge();
     $('#stscdev_extensions_menu_button').removeClass('stscdev-has-update').find('.stscdev-menu-update-badge').remove();
     if (updateToast) {
         try { toastr.clear(updateToast); } catch { /* 忽略旧 toast 清理失败 */ }
@@ -4683,6 +4825,7 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null) {
         clearPluginUpdateNotice();
         return;
     }
+    renderHeaderUpdateBadge();
 
     const $menuButton = $('#stscdev_extensions_menu_button');
     $menuButton.addClass('stscdev-has-update');

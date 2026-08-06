@@ -1243,7 +1243,7 @@ body.stscdev-modal-open {
     padding-inline: 8px !important;
   }
 
-  /* 五个菜单在小屏固定排成两行，不再横向截断。 */
+  /* 六个菜单在小屏固定排成两排三列，不再横向截断。 */
   .stscdev-tabs {
     display: grid !important;
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -2104,7 +2104,27 @@ body.stscdev-modal-open {
   line-height: 1.2;
   color: var(--stscdev-accent);
   vertical-align: middle;
+  position: relative;
+  cursor: pointer;
+  background: transparent;
 }
+
+.stscdev-header-log-button { position: relative; white-space: nowrap; }
+.stscdev-header-dot { display: none; position: absolute; right: -3px; top: -3px; width: 9px; height: 9px; border: 2px solid var(--stscdev-panel); border-radius: 50%; background: #ef4444; box-sizing: content-box; }
+.has-notice > .stscdev-header-dot { display: block; }
+.stscdev-status-lights, .stscdev-status-switch-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-top: 8px; }
+.stscdev-status-lights > span { display: flex; align-items: center; gap: 7px; padding: 8px 10px; border: 1px solid var(--stscdev-border); border-radius: 9px; }
+.stscdev-signal { display: inline-block; flex: 0 0 9px; width: 9px; height: 9px; border-radius: 50%; background: #8b8b8b; box-shadow: 0 0 0 3px color-mix(in srgb, #8b8b8b 16%, transparent); }
+.stscdev-signal.is-on { background: #35b96f; box-shadow: 0 0 0 3px color-mix(in srgb, #35b96f 18%, transparent); }
+.stscdev-signal.is-off { background: #df5353; box-shadow: 0 0 0 3px color-mix(in srgb, #df5353 18%, transparent); }
+.stscdev-signal.is-na { background: #858585; }
+.stscdev-log-summary { margin-bottom: 10px; color: var(--stscdev-muted); }
+.stscdev-log-list { display: flex; flex-direction: column; gap: 9px; max-height: min(58vh, 580px); overflow: auto; }
+.stscdev-log-item { padding: 11px; border: 1px solid var(--stscdev-border); border-left: 4px solid #888; border-radius: 10px; }
+.stscdev-log-item.is-error { border-left-color: #df5353; }
+.stscdev-log-item.is-warning { border-left-color: #e2a93b; }
+.stscdev-log-head { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 7px; }
+.stscdev-log-head time { color: var(--stscdev-muted); font-size: 12px; }
 
 .stscdev-batch-reference-tools {
   display: flex;
@@ -2239,6 +2259,8 @@ body.stscdev-modal-open {
     min-width: 0 !important;
     flex: 0 0 auto !important;
   }
+  .stscdev-status-lights, .stscdev-status-switch-grid { grid-template-columns: 1fr; }
+  .stscdev-header-log-button { padding-inline: 7px !important; min-width: 0 !important; }
 }
 /* v0.3.4：悬浮按钮尺寸可调，50px 为原始最大尺寸，最小 34px。 */
 #stscdev_floating_root {
