@@ -872,13 +872,26 @@ body.stscdev-modal-open {
 
 .stscdev-floating-root {
   position: fixed;
-  z-index: 2147482500;
+  z-index: 2500;
   width: 48px;
   height: 48px;
   color: var(--stscdev-text);
   user-select: none;
   -webkit-user-select: none;
   -webkit-tap-highlight-color: transparent;
+  transition: transform 180ms ease;
+}
+
+.stscdev-floating-root.stscdev-mobile-edge-docked[data-edge-dock="left"]:not(.stscdev-floating-dragging) {
+  transform: translateX(calc(-1 * var(--stscdev-edge-tuck-offset, 33px)));
+}
+
+.stscdev-floating-root.stscdev-mobile-edge-docked[data-edge-dock="right"]:not(.stscdev-floating-dragging) {
+  transform: translateX(var(--stscdev-edge-tuck-offset, 33px));
+}
+
+.stscdev-floating-root.stscdev-floating-dragging {
+  transition: none;
 }
 
 .stscdev-floating-button {
@@ -1147,7 +1160,7 @@ body.stscdev-modal-open {
 }
 
 .stscdev-floating-panel {
-  z-index: 2147482600;
+  z-index: 2850;
   width: min(420px, calc(100vw - 24px));
   max-height: min(640px, 72dvh);
   display: flex;
@@ -1352,7 +1365,7 @@ body.stscdev-modal-open {
 /* v0.1.7：移动端悬浮问答面板彻底脱离按钮容器，并由 JS 按 visualViewport 设置明确像素尺寸。 */
 #stscdev_floating_panel {
   position: fixed !important;
-  z-index: 2147483600 !important;
+  z-index: 2850 !important;
   display: flex;
   flex-direction: column;
   min-width: 0 !important;

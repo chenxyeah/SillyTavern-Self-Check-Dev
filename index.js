@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.14';
+const STSC_VERSION = '0.4.0-beta.16';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -27,13 +27,13 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-08-06',
-    title: '修复插件内更新检查与版本弹窗入口',
+    releasedAt: '2026-08-07',
+    title: '移动端悬浮球贴边收纳',
     changes: Object.freeze([
-        '插件内检查更新现在会读取酒馆Git接口返回的 isUpToDate，不再只判断请求是否成功。',
-        '浏览器无法直连GitHub版本JSON时，仍可根据酒馆服务器端Git结果发现远程新提交。',
-        '更新通知点击后改为打开顶部版本弹窗，不再跳转到已经移除的旧版本标签页。',
-        '备用仓库入口修正为DEV测试仓库。',
+        '仅在移动端，悬浮球拖到屏幕左侧或右侧边缘后会自动收纳一半。',
+        '贴边位置会随设置保存，刷新页面或旋转屏幕后仍会保持。',
+        '悬浮球与悬浮面板的显示层级已降低，酒馆的预设、美化和其他功能页面可以正常遮住它们。',
+        '插件自己的管理器与确认弹窗仍会显示在悬浮球上方。',
     ]),
 });
 
@@ -120,6 +120,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         floatingPosition: {
             leftRatio: 0.82,
             topRatio: 0.68,
+            edgeDock: '',
         },
     },
     migrations: {
@@ -184,10 +185,30 @@ function sanitizeLogText(value) {
         .slice(0, 6000);
 }
 
+function compactRuntimeLogMessage(level, stage, message, handling = '') {
+    const stageText = String(stage || '运行');
+    const source = String(message || '');
+    const handlingText = String(handling || '');
+    if (stageText === '自检解析') {
+        const countMatch = handlingText.match(/(\d+)\s*\/\s*(\d+)/);
+        if (countMatch && countMatch[1] !== countMatch[2]) return `自检回答不完整：识别到 ${countMatch[1]}/${countMatch[2]} 题。`;
+        if (/结束标签缺失|没有正确闭合|自动补全/.test(source)) return '自检标签不完整，插件已自动修复。';
+        if (/没有输出|未输出|完全没有/.test(source)) return '本轮没有检测到完整的自检输出。';
+        return '自检输出格式不完整。';
+    }
+    if (stageText === '自检API') {
+        if (/超时|超过\s*\d+\s*秒/.test(source)) return '自检API请求超时。';
+        if (/401|403|密钥|认证|授权/.test(source)) return '自检API认证失败。';
+        return level === 'warning' ? '自检API调用失败，已执行备用处理。' : '自检API调用失败。';
+    }
+    return source.length > 180 ? `${source.slice(0, 180)}…` : source;
+}
+
 function addRuntimeLog(level, stage, message, handling = '') {
     const settings = normalizeSettings();
     if (!settings) return;
-    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(message), handling: sanitizeLogText(handling) });
+    const compactMessage = compactRuntimeLogMessage(level, stage, message, handling);
+    settings.logs.unshift({ id: uid('log'), timestamp: Date.now(), level, stage: sanitizeLogText(stage), message: sanitizeLogText(compactMessage), handling: sanitizeLogText(handling).slice(0, 240) });
     settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
     saveSettings();
     renderLogBadge();
@@ -272,8 +293,17 @@ function normalizeSettings() {
     settings.dualApi.transformFormat = Boolean(settings.dualApi.transformFormat);
     settings.dualApi.failureMode = ['fallback_single', 'stop'].includes(settings.dualApi.failureMode) ? settings.dualApi.failureMode : 'fallback_single';
     settings.dualApi.previousReview = Boolean(settings.dualApi.previousReview);
+    let compactedLegacyLogs = false;
     if (!Array.isArray(settings.logs)) settings.logs = [];
     settings.logs = settings.logs.filter(item => item && typeof item === 'object').slice(0, STSC_LOG_LIMIT);
+    for (const item of settings.logs) {
+        const alreadyCompact = /^(?:自检回答不完整|自检标签不完整|自检输出格式不完整|本轮没有检测到完整的自检输出)/.test(String(item.message || ''));
+        if (item.stage === '自检解析' && !alreadyCompact) {
+            item.message = compactRuntimeLogMessage(item.level, item.stage, item.message, item.handling);
+            item.handling = sanitizeLogText(item.handling).slice(0, 240);
+            compactedLegacyLogs = true;
+        }
+    }
     settings.logLastViewedAt = Math.max(0, Number(settings.logLastViewedAt) || 0);
 
     if (!Array.isArray(settings.presets)) settings.presets = [];
@@ -306,9 +336,12 @@ function normalizeSettings() {
     }
     settings.appearance.floatingPosition.leftRatio = clampNumber(settings.appearance.floatingPosition.leftRatio, 0, 1, 0.82);
     settings.appearance.floatingPosition.topRatio = clampNumber(settings.appearance.floatingPosition.topRatio, 0, 1, 0.68);
+    settings.appearance.floatingPosition.edgeDock = ['left', 'right'].includes(settings.appearance.floatingPosition.edgeDock)
+        ? settings.appearance.floatingPosition.edgeDock
+        : '';
     delete settings.appearance.floatingPosition.side;
 
-    let settingsMigrated = false;
+    let settingsMigrated = compactedLegacyLogs;
     if (settings.presets.length === 0) {
         const general = createBuiltInGeneralPreset();
         settings.presets.push(general);
@@ -1082,7 +1115,7 @@ function visibleRect(selector) {
 
 function floatingViewportMetrics() {
     const button = document.getElementById('stscdev_floating_button');
-    const size = Math.max(46, button?.getBoundingClientRect?.().width || 50);
+    const size = Math.max(34, button?.getBoundingClientRect?.().width || 50);
     const compact = window.matchMedia?.('(max-width: 700px)')?.matches;
     const margin = compact ? 8 : 14;
     const viewportHeight = window.visualViewport?.height || window.innerHeight || document.documentElement.clientHeight || 800;
@@ -1115,27 +1148,53 @@ function floatingViewportMetrics() {
     return { size, margin, viewportHeight, viewportWidth, minLeft, maxLeft, minTop, maxTop, topSafe, bottomSafe };
 }
 
+function isMobileFloatingLayout(metrics = floatingViewportMetrics()) {
+    const narrowViewport = window.matchMedia?.('(max-width: 700px)')?.matches;
+    const coarsePointer = window.matchMedia?.('(pointer: coarse)')?.matches;
+    const phoneLikeViewport = Math.min(metrics.viewportWidth, metrics.viewportHeight) <= 700
+        && Math.max(metrics.viewportWidth, metrics.viewportHeight) <= 1000;
+    return Boolean(narrowViewport || (coarsePointer && phoneLikeViewport));
+}
+
+function resolveFloatingEdgeDock(left, metrics = floatingViewportMetrics()) {
+    if (!isMobileFloatingLayout(metrics)) return '';
+    const threshold = Math.max(28, metrics.size * 0.7);
+    if (left <= metrics.minLeft + threshold) return 'left';
+    if (left >= metrics.maxLeft - threshold) return 'right';
+    return '';
+}
+
 function applyFloatingPosition(settings = getUiSettings()) {
     const root = document.getElementById('stscdev_floating_root');
     if (!root) return;
     const position = settings?.appearance?.floatingPosition || DEFAULT_SETTINGS.appearance.floatingPosition;
-    const { minLeft, maxLeft, minTop, maxTop, viewportWidth, viewportHeight, topSafe, bottomSafe } = floatingViewportMetrics();
+    const metrics = floatingViewportMetrics();
+    const { size, margin, minLeft, maxLeft, minTop, maxTop, viewportWidth, viewportHeight, topSafe, bottomSafe } = metrics;
     const leftRatio = clampNumber(position.leftRatio, 0, 1, 0.82);
     const topRatio = clampNumber(position.topRatio, 0, 1, 0.68);
-    const left = minLeft + (maxLeft - minLeft) * leftRatio;
+    const requestedDock = ['left', 'right'].includes(position.edgeDock) ? position.edgeDock : '';
+    const edgeDock = isMobileFloatingLayout(metrics) ? requestedDock : '';
+    const left = edgeDock === 'left'
+        ? minLeft
+        : edgeDock === 'right'
+            ? maxLeft
+            : minLeft + (maxLeft - minLeft) * leftRatio;
     const top = minTop + (maxTop - minTop) * topRatio;
 
     root.style.setProperty('--stscdev-safe-top', `${Math.round(topSafe)}px`);
     root.style.setProperty('--stscdev-safe-bottom', `${Math.round(bottomSafe)}px`);
+    root.style.setProperty('--stscdev-edge-tuck-offset', `${Math.round(size / 2 + margin)}px`);
     root.style.left = `${Math.round(left)}px`;
     root.style.right = 'auto';
     root.style.top = `${Math.round(top)}px`;
     root.style.bottom = 'auto';
-    root.dataset.horizontal = left + 25 > viewportWidth / 2 ? 'right' : 'left';
-    root.dataset.vertical = top + 25 > viewportHeight / 2 ? 'bottom' : 'top';
+    root.dataset.edgeDock = edgeDock;
+    root.classList.toggle('stscdev-mobile-edge-docked', Boolean(edgeDock));
+    root.dataset.horizontal = left + size / 2 > viewportWidth / 2 ? 'right' : 'left';
+    root.dataset.vertical = top + size / 2 > viewportHeight / 2 ? 'bottom' : 'top';
 }
 
-function persistFloatingPosition(left, top) {
+function persistFloatingPosition(left, top, edgeDock = '') {
     const actual = normalizeSettings();
     if (!actual) return;
     const { minLeft, maxLeft, minTop, maxTop } = floatingViewportMetrics();
@@ -1144,6 +1203,7 @@ function persistFloatingPosition(left, top) {
     const next = {
         leftRatio: clampNumber((safeLeft - minLeft) / Math.max(1, maxLeft - minLeft), 0, 1, 0.82),
         topRatio: clampNumber((safeTop - minTop) / Math.max(1, maxTop - minTop), 0, 1, 0.68),
+        edgeDock: ['left', 'right'].includes(edgeDock) ? edgeDock : '',
     };
     actual.appearance.floatingPosition = next;
     if (editDraft?.appearance) editDraft.appearance.floatingPosition = clone(next);
@@ -1281,6 +1341,7 @@ function beginFloatingDrag(event) {
     const root = document.getElementById('stscdev_floating_root');
     const button = document.getElementById('stscdev_floating_button');
     if (!root || !button) return;
+    root.classList.add('stscdev-floating-dragging');
     const rect = root.getBoundingClientRect();
     floatingDragState = {
         pointerId: event.pointerId,
@@ -1291,7 +1352,6 @@ function beginFloatingDrag(event) {
         moved: false,
     };
     button.setPointerCapture?.(event.pointerId);
-    root.classList.add('stscdev-floating-dragging');
 }
 
 function moveFloatingDrag(event) {
@@ -1323,16 +1383,23 @@ function endFloatingDrag(event) {
     if (!state || !root || (state.pointerId !== undefined && event.pointerId !== state.pointerId)) return;
     floatingDragState = null;
     button?.releasePointerCapture?.(event.pointerId);
-    root.classList.remove('stscdev-floating-dragging');
 
-    if (event.type === 'pointercancel') return;
+    if (event.type === 'pointercancel') {
+        root.classList.remove('stscdev-floating-dragging');
+        return;
+    }
 
     if (state.moved) {
         const rect = root.getBoundingClientRect();
-        persistFloatingPosition(rect.left, rect.top);
+        const edgeDock = resolveFloatingEdgeDock(rect.left);
+        persistFloatingPosition(rect.left, rect.top, edgeDock);
+        root.classList.remove('stscdev-floating-dragging');
         suppressFloatingClickUntil = Date.now() + 450;
         event.preventDefault();
+        return;
     }
+
+    root.classList.remove('stscdev-floating-dragging');
 }
 
 function characterEntityFrom(character, index = '') {
@@ -3147,7 +3214,7 @@ function renderAppearanceTab() {
                 <div class="stscdev-field stscdev-range-field"><label>宽度 <span id="stscdev_floating_width_value">${Math.round(settings.appearance.floatingWidth)}px</span></label><input id="stscdev_floating_width" type="range" min="300" max="680" step="10" value="${Math.round(settings.appearance.floatingWidth)}"></div>
                 <div class="stscdev-field stscdev-range-field"><label>高度 <span id="stscdev_floating_height_value">${Math.round(settings.appearance.floatingHeight)}px</span></label><input id="stscdev_floating_height" type="range" min="300" max="820" step="10" value="${Math.round(settings.appearance.floatingHeight)}"></div>
             </div>
-            <div class="stscdev-muted">移动端会自动限制在安全区域内；悬浮按钮位置会持续保存。</div>
+            <div class="stscdev-muted">移动端会自动限制在安全区域内，拖到左右边缘后会收纳一半；悬浮按钮位置会持续保存。</div>
         </div>`);
 }
 
