@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.16';
+const STSC_VERSION = '0.4.0-beta.17';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -27,13 +27,14 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-08-07',
-    title: '移动端悬浮球贴边收纳',
+    releasedAt: '2026-08-26',
+    title: '双API超时与解析可靠性修复',
     changes: Object.freeze([
-        '仅在移动端，悬浮球拖到屏幕左侧或右侧边缘后会自动收纳一半。',
-        '贴边位置会随设置保存，刷新页面或旋转屏幕后仍会保持。',
-        '悬浮球与悬浮面板的显示层级已降低，酒馆的预设、美化和其他功能页面可以正常遮住它们。',
-        '插件自己的管理器与确认弹窗仍会显示在悬浮球上方。',
+        '自检API超时改为可配置，并对超时、限流、服务器异常与网络中断执行一次精简重试。',
+        '自检问题改用短题号，解析器兼容原ID、题号、输出顺序、未加引号属性与转义XML。',
+        '旧版默认2000 Token自动迁移为4096 Token，降低多题回答在结尾被截断的概率。',
+        '0题或关键答案缺失时不再把空结果交给正文API；自动重试失败后按设置安全回退。',
+        '已成功修复的结束标签不再记为警告，API日志会保留脱敏后的实际错误与HTTP状态。',
     ]),
 });
 
@@ -95,7 +96,9 @@ const DEFAULT_SETTINGS = Object.freeze({
         endpoint: '',
         apiKey: '',
         model: '',
-        maxTokens: 2000,
+        maxTokens: 4096,
+        timeoutSeconds: 150,
+        retryTransient: true,
         contextMode: 'recent5',
         customTurns: 5,
         transformFormat: false,
@@ -128,6 +131,7 @@ const DEFAULT_SETTINGS = Object.freeze({
         defaultGeneralCoreV2: false,
         defaultGeneralCoreV3: false,
         defaultGeneralCoreV4: false,
+        dualApiReliabilityV1: false,
     },
     updateNotice: {
         lastCheckedAt: 0,
@@ -197,9 +201,9 @@ function compactRuntimeLogMessage(level, stage, message, handling = '') {
         return '自检输出格式不完整。';
     }
     if (stageText === '自检API') {
-        if (/超时|超过\s*\d+\s*秒/.test(source)) return '自检API请求超时。';
-        if (/401|403|密钥|认证|授权/.test(source)) return '自检API认证失败。';
-        return level === 'warning' ? '自检API调用失败，已执行备用处理。' : '自检API调用失败。';
+        if (/超时|超过\s*\d+\s*秒/.test(source)) return source.length > 500 ? `${source.slice(0, 500)}…` : source;
+        if (/401|403|密钥|认证|授权/.test(source)) return `自检API认证失败：${source}`.slice(0, 500);
+        return `自检API调用失败：${source || '未知错误'}`.slice(0, 500);
     }
     return source.length > 180 ? `${source.slice(0, 180)}…` : source;
 }
@@ -286,7 +290,9 @@ function normalizeSettings() {
     settings.dualApi.endpoint = String(settings.dualApi.endpoint || '');
     settings.dualApi.apiKey = String(settings.dualApi.apiKey || '');
     settings.dualApi.model = String(settings.dualApi.model || '');
-    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 2000);
+    settings.dualApi.maxTokens = clampNumber(settings.dualApi.maxTokens, 256, 12000, 4096);
+    settings.dualApi.timeoutSeconds = clampNumber(settings.dualApi.timeoutSeconds, 60, 300, 150);
+    settings.dualApi.retryTransient = Boolean(settings.dualApi.retryTransient);
     // beta.3：聊天范围只保留“默认最近5轮 / 自定义 / 全部”。旧界面的跟随、10轮、20轮统一迁移为最近5轮。
     settings.dualApi.contextMode = ['recent5', 'custom', 'all'].includes(settings.dualApi.contextMode) ? settings.dualApi.contextMode : 'recent5';
     settings.dualApi.customTurns = clampNumber(settings.dualApi.customTurns, 1, 100, 5);
@@ -342,6 +348,12 @@ function normalizeSettings() {
     delete settings.appearance.floatingPosition.side;
 
     let settingsMigrated = compactedLegacyLogs;
+    if (!settings.migrations.dualApiReliabilityV1) {
+        // beta.17：旧版默认 2000 Token 容易在 6～8 题时截断；只迁移旧默认值，保留用户主动设置的其他数值。
+        if (Math.round(settings.dualApi.maxTokens) === 2000) settings.dualApi.maxTokens = 4096;
+        settings.migrations.dualApiReliabilityV1 = true;
+        settingsMigrated = true;
+    }
     if (settings.presets.length === 0) {
         const general = createBuiltInGeneralPreset();
         settings.presets.push(general);
@@ -1582,22 +1594,23 @@ function positionLabel(position) {
 function lengthInstruction(length) {
     return {
         brief: '简短：一句话或非常精炼的结论',
-        standard: '标准：一至三句话，说明结论和必要依据',
-        detailed: '详细：充分说明结论、依据、风险与修正方向',
+        standard: '标准：一至两句话，说明结论和必要依据',
+        detailed: '详细：二至四句话，说明结论、依据、风险与修正方向',
     }[length] || '标准回答';
 }
 
 function buildQuestionXml(questions) {
     return questions.map((question, index) => {
+        const requestId = `q${index + 1}`;
         const typeRule = question.type === 'boolean'
-            ? '判断题：<answer>必须以“是”或“否”开头，再补充具体说明。'
-            : '开放问答题：<answer>必须给出具体结论，不得只写“已注意”“会遵守”。';
+            ? '判断题：answer字段必须以“是”或“否”开头，再补充具体说明。'
+            : '开放问答题：answer字段必须给出具体结论，不得只写“已注意”“会遵守”。';
         const evidenceRule = question.requireEvidence
-            ? '必须另外输出非空的<evidence>，写明可核对的剧情依据、角色设定依据或世界观依据；不得把依据只混写在<answer>里。'
-            : '无需强制输出<evidence>；回答必须明确。';
+            ? '必须另外输出非空的evidence字段，用一句话写明可核对的剧情、角色设定或世界观依据；不得把依据只混写在answer字段里。'
+            : '无需强制输出evidence字段；回答必须明确。';
         const requiredFields = question.requireEvidence ? 'answer,evidence' : 'answer';
         return [
-            `<question id="${escapeXml(question.id)}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
+            `<question id="${requestId}" index="${index + 1}" evidence_required="${question.requireEvidence ? 'true' : 'false'}">`,
             `<text>${escapeXml(question.text)}</text>`,
             `<source>${escapeXml(question.source || '')}</source>`,
             `<type>${typeRule}</type>`,
@@ -1631,8 +1644,8 @@ function buildSinglePrompt(questions) {
 你必须严格输出以下结构：
 （如原预设要求，先正常输出其 thinking / reasoning 内容）
 <stscdev_self_check>
-无需依据：<item id="题目ID"><answer>最终回答</answer></item>
-需要依据：<item id="题目ID"><answer>最终回答</answer><evidence>具体依据</evidence></item>
+无需依据：<item id="q1"><answer>最终回答</answer></item>
+需要依据：<item id="q2"><answer>最终回答</answer><evidence>具体依据</evidence></item>
 </stscdev_self_check>
 紧接着直接输出正文、状态栏以及用户要求的全部正常输出格式。
 正文不得再包裹在任何由本插件添加的标签中。
@@ -1710,7 +1723,14 @@ function getCharacterField(character, field) {
     return compactPromptText(direct ?? nested ?? '');
 }
 
-function formatCharacterCardForDualApi(character) {
+function compactDualApiRetryText(value, limit) {
+    const text = compactPromptText(value);
+    if (text.length <= limit) return text;
+    const half = Math.max(1, Math.floor((limit - 40) / 2));
+    return `${text.slice(0, half)}\n…（精简重试已省略中段）…\n${text.slice(-half)}`;
+}
+
+function formatCharacterCardForDualApi(character, { compact = false } = {}) {
     if (!character) return '';
     const fields = [
         ['角色名称', getCharacterField(character, 'name')],
@@ -1718,21 +1738,24 @@ function formatCharacterCardForDualApi(character) {
         ['性格', getCharacterField(character, 'personality')],
         ['场景', getCharacterField(character, 'scenario')],
         ['角色系统提示', getCharacterField(character, 'system_prompt')],
-        ['历史后置指令', getCharacterField(character, 'post_history_instructions')],
-        ['示例对话', getCharacterField(character, 'mes_example')],
-        ['首条消息', getCharacterField(character, 'first_mes')],
+        ...(!compact ? [
+            ['历史后置指令', getCharacterField(character, 'post_history_instructions')],
+            ['示例对话', getCharacterField(character, 'mes_example')],
+            ['首条消息', getCharacterField(character, 'first_mes')],
+        ] : []),
     ].filter(([, value]) => value);
     if (!fields.length) return '';
-    return fields.map(([label, value]) => `【${label}】\n${value}`).join('\n\n');
+    const text = fields.map(([label, value]) => `【${label}】\n${value}`).join('\n\n');
+    return compact ? compactDualApiRetryText(text, 12000) : text;
 }
 
-function getDualApiCharacterContext() {
+function getDualApiCharacterContext({ compact = false } = {}) {
     const context = ctx();
     if (!context) return '';
 
     if (!context.groupId) {
         const character = context.characters?.[Number(context.characterId)];
-        return formatCharacterCardForDualApi(character);
+        return formatCharacterCardForDualApi(character, { compact });
     }
 
     const group = context.groups?.find?.(item => String(item.id) === String(context.groupId));
@@ -1743,7 +1766,7 @@ function getDualApiCharacterContext() {
             const name = String(character?.name || character?.data?.name || '');
             return memberKeys.has(avatar) || memberKeys.has(name);
         })
-        .map(formatCharacterCardForDualApi)
+        .map(character => formatCharacterCardForDualApi(character, { compact }))
         .filter(Boolean);
     const title = group?.name ? `【当前群聊】\n${group.name}` : '【当前群聊】';
     return [title, ...cards].join('\n\n---\n\n');
@@ -1799,7 +1822,7 @@ function selectDualApiChat(chat, dual) {
     return previous.slice(startIndex).concat(source.slice(currentUserIndex));
 }
 
-function buildDualApiReferenceContext(references) {
+function buildDualApiReferenceContext(references, { compact = false } = {}) {
     if (!references.length) return '（本轮未启用插件参考资料库）';
     return references.map((reference, index) => {
         const config = referenceTypeConfig(reference.type);
@@ -1807,7 +1830,7 @@ function buildDualApiReferenceContext(references) {
             `<reference index="${index + 1}" id="${escapeXml(reference.id)}" type="${escapeXml(reference.type)}">`,
             `<name>${escapeXml(reference.name || '未命名资料')}</name>`,
             `<category>${escapeXml(config.label)}</category>`,
-            `<content>${escapeXml(reference.content.trim())}</content>`,
+            `<content>${escapeXml(compact ? compactDualApiRetryText(reference.content, 6000) : reference.content.trim())}</content>`,
             `</reference>`,
         ].join('\n');
     }).join('\n');
@@ -1853,7 +1876,7 @@ ${source.output || '（没有可读取的上一轮正文）'}
 }
 
 function parsePreviousReview(text) {
-    const source = String(text || '');
+    const source = normalizeModelXmlText(text).source;
     const open = STSC_REVIEW_OPEN_RE.exec(source);
     if (!open) return null;
     const afterOpen = open.index + open[0].length;
@@ -1880,35 +1903,41 @@ function selectedRepairDirectives() {
     return issues.filter(item => item.selected).map(item => item.suggestion || item.description).filter(Boolean);
 }
 
-function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings) {
-    const characterContext = getDualApiCharacterContext() || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
-    const selectedChat = selectDualApiChat(chat, settings.dualApi);
-    const reviewRequest = buildPreviousReviewRequest(settings);
+function buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact = false } = {}) {
+    const characterContext = getDualApiCharacterContext({ compact }) || '（没有读取到当前角色卡文本，请主要依据聊天记录、问题与参考资料判断。）';
+    const dualForChat = compact
+        ? { ...settings.dualApi, contextMode: 'custom', customTurns: Math.min(2, settings.dualApi.customTurns || 2) }
+        : settings.dualApi;
+    const selectedChat = selectDualApiChat(chat, dualForChat).map(message => compact
+        ? { ...message, content: compactDualApiRetryText(message.content, 6000) }
+        : message);
+    const reviewRequest = compact ? '' : buildPreviousReviewRequest(settings);
     const repairDirectives = selectedRepairDirectives();
     const systemPrompt = `
 [墨提斯之镜 DEV｜独立自检API]
 你是写作前置自检模型。你的唯一任务是为下一步“酒馆主API”完成本轮自检，不得写角色扮演正文、对白、动作描写、状态栏或续写剧情。
+${compact ? '这是一次自动精简重试：只读取必要角色信息和最近2轮聊天，请优先快速、完整地输出全部题目。' : ''}
 
 工作要求：
 1. 结合角色资料、经过酒馆出站正则处理后的聊天记录、插件参考资料、快捷指令和本轮问题，逐题形成最终写作结论。
 2. 每个答案都必须能直接交给另一个没有看到题目背景或资料原文的写作模型执行。
 3. 尤其是参考资料库问题，必须明确复述本轮具体该怎样写、必须遵守什么、禁止什么，不得只写“遵照资料”“符合要求”“按上述内容执行”等模糊结论。
-4. 不得漏题、合并题目或改变题目ID。
+4. 不得漏题、合并题目或改变 q1、q2 这类短题号。
 5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
-6. 每个答案只写最终结论，控制在2—5句；不要展开思考过程，避免输出过长而截断。
+6. 每个答案只写最终结论，控制在1—3句；依据通常只写1句。不要展开思考过程，避免输出过长而截断。
 7. 只输出下方指定的XML，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
 
 严格输出格式：
 <stscdev_self_check>
-<item id="无需依据的题目ID"><answer>可独立执行的最终回答</answer></item>
-<item id="需要依据的题目ID"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
+<item id="q1"><answer>可独立执行的最终回答</answer></item>
+<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
 </stscdev_self_check>
 
 【当前角色资料】
 ${characterContext}
 
 【本轮启用的插件参考资料库】
-${buildDualApiReferenceContext(references)}
+${buildDualApiReferenceContext(references, { compact })}
 
 【本轮启用的快捷指令】
 ${buildDualApiTemporaryContext(temporaryInstructions)}
@@ -1919,7 +1948,7 @@ ${reviewRequest}
 `.trim();
 
     const answerStyleInstruction = settings.dualApi.transformFormat
-        ? `回答将被转换为强力执行规范。每个 <answer> 只写可直接执行的结论：不要重复问题、资料库名称或分析过程；优先使用“必须／不得／应当”等明确措辞，控制在 1—4 条完整规则内。<evidence> 只保留最关键依据，通常 1—2 句，且不要重复答案。`
+        ? `回答将被转换为强力执行规范。每个 <answer> 只写可直接执行的结论：不要重复问题、资料库名称或分析过程；优先使用“必须／不得／应当”等明确措辞，控制在 1—3 条完整规则内。<evidence> 只保留最关键依据，通常 1 句，且不要重复答案。`
         : `每个 <answer> 必须完整、明确、自包含，不得只回答“是／否”“会遵照”或使用依赖原文才能理解的模糊指代。`;
 
     const questionPrompt = `
@@ -1963,7 +1992,32 @@ function extractDualApiText(payload) {
     return '';
 }
 
-async function callDualApiSelfCheck({ chat, questions, references, temporaryInstructions, settings }) {
+function isTransientDualApiFailure(error) {
+    if (error?.transient === true) return true;
+    if (error?.name === 'TypeError') return true;
+    return /(?:429|5\d\d|rate.?limit|too many requests|temporar|overload|network|fetch failed|socket|timeout|超时|限流|繁忙|网络)/i.test(String(error?.message || error || ''));
+}
+
+function dualApiProviderErrorText(payload, responseText = '') {
+    const candidate = payload?.error?.message ?? payload?.message ?? payload?.error ?? responseText;
+    if (candidate && typeof candidate === 'object') {
+        try {
+            return compactPromptText(JSON.stringify(candidate));
+        } catch {
+            return compactPromptText(String(candidate));
+        }
+    }
+    return compactPromptText(candidate);
+}
+
+function waitForDualApiRetry(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+async function callDualApiSelfCheck(
+    { chat, questions, references, temporaryInstructions, settings },
+    { compact = false, allowTransientRetry = true, timeoutSecondsOverride = 0 } = {},
+) {
     const dual = settings.dualApi;
     const endpoint = normalizeDualApiBaseUrl(dual.endpoint);
     const model = String(dual.model || '').trim();
@@ -1971,56 +2025,91 @@ async function callDualApiSelfCheck({ chat, questions, references, temporaryInst
     if (!model) throw new Error('尚未选择自检模型。请先在设置页获取并选择模型，然后保存。');
 
     const context = ctx();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120000);
-    try {
-        const headers = {
-            'Content-Type': 'application/json',
-            ...(context?.getRequestHeaders?.() || {}),
-        };
-        const response = await fetch('/api/backends/chat-completions/generate', {
-            method: 'POST',
-            headers,
-            signal: controller.signal,
-            body: JSON.stringify({
-                type: 'quiet',
-                messages: buildDualApiMessages(chat, questions, references, temporaryInstructions, settings),
-                model,
-                temperature: 0.2,
-                frequency_penalty: 0,
-                presence_penalty: 0,
-                top_p: 1,
-                max_tokens: clampNumber(dual.maxTokens, 256, 12000, 2000),
-                stream: false,
-                chat_completion_source: 'openai',
-                reverse_proxy: endpoint,
-                proxy_password: String(dual.apiKey || ''),
-                include_reasoning: false,
-            }),
-        });
+    const configuredTimeout = clampNumber(timeoutSecondsOverride || dual.timeoutSeconds, 60, 300, 150);
+    const maxAttempts = allowTransientRetry && dual.retryTransient ? 2 : 1;
+    let lastError = null;
 
-        const responseText = await response.text();
-        let payload = {};
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const retrying = attempt > 0;
+        const attemptCompact = compact || retrying;
+        const attemptTimeoutSeconds = retrying ? Math.min(configuredTimeout, 60) : configuredTimeout;
+        const controller = new AbortController();
+        const startedAt = Date.now();
+        const timeout = setTimeout(() => controller.abort(), attemptTimeoutSeconds * 1000);
+
         try {
-            payload = responseText ? JSON.parse(responseText) : {};
-        } catch {
-            payload = { text: responseText };
-        }
+            const headers = {
+                'Content-Type': 'application/json',
+                ...(context?.getRequestHeaders?.() || {}),
+            };
+            const response = await fetch('/api/backends/chat-completions/generate', {
+                method: 'POST',
+                headers,
+                signal: controller.signal,
+                body: JSON.stringify({
+                    type: 'quiet',
+                    messages: buildDualApiMessages(chat, questions, references, temporaryInstructions, settings, { compact: attemptCompact }),
+                    model,
+                    temperature: 0.15,
+                    frequency_penalty: 0,
+                    presence_penalty: 0,
+                    top_p: 1,
+                    max_tokens: clampNumber(dual.maxTokens, 256, 12000, 4096),
+                    stream: false,
+                    chat_completion_source: 'openai',
+                    reverse_proxy: endpoint,
+                    proxy_password: String(dual.apiKey || ''),
+                    include_reasoning: false,
+                }),
+            });
 
-        if (!response.ok || payload?.error) {
-            const message = compactPromptText(payload?.error?.message || payload?.message || payload?.error || responseText);
-            throw new Error(message || `自检API请求失败（HTTP ${response.status}）。`);
-        }
+            const responseText = await response.text();
+            let payload = {};
+            try {
+                payload = responseText ? JSON.parse(responseText) : {};
+            } catch {
+                payload = { text: responseText };
+            }
 
-        const text = extractDualApiText(payload);
-        if (!text) throw new Error('自检API返回成功，但没有读取到任何文本。');
-        return text;
-    } catch (error) {
-        if (error?.name === 'AbortError') throw new Error('自检API等待超过120秒，已超时。');
-        throw error;
-    } finally {
-        clearTimeout(timeout);
+            if (!response.ok || payload?.error) {
+                const providerMessage = dualApiProviderErrorText(payload, responseText);
+                const error = new Error(`${response.status ? `HTTP ${response.status}：` : ''}${providerMessage || '自检API返回错误。'}`);
+                error.httpStatus = response.status;
+                error.transient = [408, 425, 429].includes(response.status) || response.status >= 500;
+                throw error;
+            }
+
+            const text = extractDualApiText(payload);
+            if (!text) {
+                const error = new Error('自检API返回成功，但没有读取到任何文本。');
+                error.transient = true;
+                throw error;
+            }
+            return { text, attempts: attempt + 1, compact: attemptCompact };
+        } catch (caught) {
+            let error = caught instanceof Error ? caught : new Error(String(caught || '未知错误'));
+            if (error.name === 'AbortError') {
+                error = new Error(`自检API等待超过${attemptTimeoutSeconds}秒，已超时。`);
+                error.code = 'timeout';
+                error.transient = true;
+            } else if (error.name === 'TypeError') {
+                error.transient = true;
+            }
+            error.elapsedMs = Date.now() - startedAt;
+            error.attempts = attempt + 1;
+            lastError = error;
+
+            if (attempt + 1 >= maxAttempts || !isTransientDualApiFailure(error)) break;
+            await waitForDualApiRetry(error.httpStatus === 429 ? 1500 : 800);
+        } finally {
+            clearTimeout(timeout);
+        }
     }
+
+    if (lastError && maxAttempts > 1 && lastError.attempts > 1) {
+        lastError.message = `${lastError.message}（已自动精简重试1次，仍未成功）`;
+    }
+    throw lastError || new Error('自检API调用失败。');
 }
 
 function dualApiAnswerRows(questions, parsed) {
@@ -2104,7 +2193,31 @@ function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
 }
 
 function dualApiFailureMessage(error) {
-    return compactPromptText(error?.message || error || '未知错误');
+    const message = compactPromptText(error?.message || error || '未知错误');
+    const details = [];
+    if (error?.httpStatus && !message.includes(`HTTP ${error.httpStatus}`)) details.push(`HTTP ${error.httpStatus}`);
+    if (Number.isFinite(error?.elapsedMs)) details.push(`最后一次请求耗时 ${(error.elapsedMs / 1000).toFixed(1)} 秒`);
+    if (error?.attempts > 1 && !message.includes('自动精简重试')) details.push(`共尝试 ${error.attempts} 次`);
+    return details.length ? `${message}（${details.join('；')}）` : message;
+}
+
+function dualParsedMissingRequirements(parsed, questions) {
+    const answerMap = new Map((parsed?.answers || []).map(answer => [answer.id, answer]));
+    return questions.filter(question => {
+        const answer = answerMap.get(question.id);
+        if (!answer?.answer?.trim()) return true;
+        return Boolean(question.requireEvidence && !answer.evidence?.trim());
+    });
+}
+
+function dualParsedIsComplete(parsed, questions) {
+    return Boolean(questions.length && dualParsedMissingRequirements(parsed, questions).length === 0);
+}
+
+function dualIncompleteMessage(parsed, questions) {
+    const answered = (parsed?.answers || []).filter(answer => answer.answer?.trim()).length;
+    const missing = dualParsedMissingRequirements(parsed, questions).length;
+    return `自检API返回格式不完整：识别到 ${answered}/${questions.length} 题，仍有 ${missing} 题缺少回答或必要依据。`;
 }
 
 async function saveLatestResult(result) {
@@ -2134,18 +2247,38 @@ async function markLatestIssueViewed() {
     await saveLatestResult(latest);
 }
 
+function normalizeModelXmlText(text) {
+    let source = String(text ?? '')
+        .replace(/^\s*```(?:xml)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '')
+        .trim();
+    let decodedOuterXml = false;
+    if (!STSC_CHECK_OPEN_RE.test(source) && /&lt;\s*stscdev_self_check\b/i.test(source)) {
+        source = decodeXmlEntities(source).trim();
+        decodedOuterXml = true;
+    }
+    return { source, decodedOuterXml };
+}
+
+function readItemAttribute(attributes, name) {
+    const match = String(attributes || '').match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'=<>]+))`, 'i'));
+    return decodeXmlEntities(match?.[1] ?? match?.[2] ?? match?.[3] ?? '').trim();
+}
+
 function parseItems(checkInner) {
     const items = [];
-    const itemRegex = /<item\s+[^>]*id=["']([^"']+)["'][^>]*>([\s\S]*?)<\/item>/gi;
+    const itemRegex = /<item\b([^>]*)>([\s\S]*?)<\/item>/gi;
     let match;
     while ((match = itemRegex.exec(checkInner)) !== null) {
-        const id = match[1].trim();
+        const attributes = match[1];
+        const id = readItemAttribute(attributes, 'id');
+        const index = Number.parseInt(readItemAttribute(attributes, 'index'), 10) || 0;
         const itemBody = match[2];
-        const answerMatch = itemBody.match(/<answer[^>]*>([\s\S]*?)<\/answer>/i);
-        const evidenceMatch = itemBody.match(/<evidence[^>]*>([\s\S]*?)<\/evidence>/i);
+        const answerMatch = itemBody.match(/<answer\b[^>]*>([\s\S]*?)<\/answer>/i);
+        const evidenceMatch = itemBody.match(/<evidence\b[^>]*>([\s\S]*?)<\/evidence>/i);
         const answer = decodeXmlEntities(answerMatch?.[1] ?? '').trim();
         const evidence = decodeXmlEntities(evidenceMatch?.[1] ?? '').trim();
-        items.push({ id, answer, evidence });
+        items.push({ id, index, answer, evidence });
     }
     return items;
 }
@@ -2179,12 +2312,14 @@ function extractVisibleBody(text) {
 }
 
 function parseModelOutput(text, expectedQuestions = []) {
-    const source = String(text ?? '').replace(/^\s*```(?:xml)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+    const normalized = normalizeModelXmlText(text);
+    const source = normalized.source;
     const openMatch = STSC_CHECK_OPEN_RE.exec(source);
     const closeMatch = STSC_CHECK_CLOSE_RE.exec(source);
     const result = {
         status: 'missing',
         formatIssues: [],
+        recoveryNotes: [],
         rawCheck: '',
         body: extractVisibleBody(source),
         items: [],
@@ -2203,16 +2338,31 @@ function parseModelOutput(text, expectedQuestions = []) {
     const inner = source.slice(innerStart, innerEnd).trim();
     if (!hasUsableClose) {
         result.repaired = true;
-        result.formatIssues.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+        result.recoveryNotes.push('自检结束标签缺失，插件已按返回文本末尾自动补全并继续解析。');
+    }
+    if (normalized.decodedOuterXml) {
+        result.repaired = true;
+        result.recoveryNotes.push('自检XML被转义，插件已自动还原后解析。');
     }
     result.rawCheck = inner;
     result.items = parseItems(inner);
     // 仅精准移除 <stscdev_self_check>…</stscdev_self_check>，保留它之前的原生 thinking / reasoning 与之后的正文。
     result.body = extractVisibleBody(source);
 
-    const itemMap = new Map(result.items.map(item => [item.id, item]));
-    result.answers = expectedQuestions.map(question => {
-        const item = itemMap.get(question.id) || {};
+    const usedItems = new Set();
+    let usedOrderFallback = false;
+    result.answers = expectedQuestions.map((question, questionIndex) => {
+        const aliases = new Set([String(question.id || '').toLowerCase(), `q${questionIndex + 1}`, String(questionIndex + 1)]);
+        let itemIndex = result.items.findIndex((item, index) => !usedItems.has(index) && item.id && aliases.has(item.id.toLowerCase()));
+        if (itemIndex < 0) {
+            itemIndex = result.items.findIndex((item, index) => !usedItems.has(index) && item.index === questionIndex + 1);
+        }
+        if (itemIndex < 0 && result.items[questionIndex] && !usedItems.has(questionIndex)) {
+            itemIndex = questionIndex;
+            usedOrderFallback = true;
+        }
+        const item = itemIndex >= 0 ? result.items[itemIndex] : {};
+        if (itemIndex >= 0) usedItems.add(itemIndex);
         return {
             id: question.id,
             question: question.text,
@@ -2223,6 +2373,10 @@ function parseModelOutput(text, expectedQuestions = []) {
             evidence: item.evidence || '',
         };
     });
+    if (usedOrderFallback) {
+        result.repaired = true;
+        result.recoveryNotes.push('部分题号与预期不一致，插件已按输出顺序恢复对应关系。');
+    }
 
     for (const answer of result.answers) {
         if (!answer.answer.trim()) {
@@ -2240,8 +2394,7 @@ function parseModelOutput(text, expectedQuestions = []) {
         result.formatIssues.push(`应回答 ${expectedQuestions.length} 题，实际识别到 ${result.items.length} 题。`);
     }
 
-    const substantiveIssues = result.formatIssues.filter(issue => !issue.includes('插件已按返回文本末尾自动补全'));
-    result.status = substantiveIssues.length ? 'format_error' : (result.repaired ? 'recovered' : 'ok');
+    result.status = result.formatIssues.length ? 'format_error' : (result.repaired ? 'recovered' : 'ok');
     return result;
 }
 
@@ -2291,6 +2444,7 @@ function makeLatestResult({ parsed, questions, mode, messageId, rawOverride = ''
         status,
         issueViewed: !['missing', 'format_error'].includes(status),
         formatIssues: parsed.formatIssues || [],
+        recoveryNotes: parsed.recoveryNotes || [],
         rawCheck: rawOverride || parsed.rawCheck || '',
         answers: parsed.answers || [],
         expectedCount: questions.length,
@@ -2491,15 +2645,49 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
         try {
             const dualQuestions = getDualApiQuestions(settings);
             pendingRun.questions = clone(dualQuestions);
-            const rawCheck = await callDualApiSelfCheck({
+            const initialResponse = await callDualApiSelfCheck({
                 chat: _chat,
                 questions: dualQuestions,
                 references,
                 temporaryInstructions,
                 settings,
             });
-            const dualParsed = parseModelOutput(rawCheck, dualQuestions);
-            const previousReview = parsePreviousReview(rawCheck);
+            let rawCheck = initialResponse.text;
+            let dualParsed = parseModelOutput(rawCheck, dualQuestions);
+            let previousReview = parsePreviousReview(rawCheck);
+
+            if (!dualParsedIsComplete(dualParsed, dualQuestions) && settings.dualApi.retryTransient && initialResponse.attempts === 1) {
+                const firstIncomplete = dualIncompleteMessage(dualParsed, dualQuestions);
+                try {
+                    const retryResponse = await callDualApiSelfCheck({
+                        chat: _chat,
+                        questions: dualQuestions,
+                        references,
+                        temporaryInstructions,
+                        settings,
+                    }, { compact: true, allowTransientRetry: false, timeoutSecondsOverride: 60 });
+                    const retryRawCheck = retryResponse.text;
+                    const retryParsed = parseModelOutput(retryRawCheck, dualQuestions);
+                    if (dualParsedIsComplete(retryParsed, dualQuestions)) {
+                        rawCheck = retryRawCheck;
+                        dualParsed = retryParsed;
+                        previousReview ||= parsePreviousReview(retryRawCheck);
+                        dualParsed.repaired = true;
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push('首次返回不完整，插件已通过精简上下文重试并取得完整结果。');
+                        if (dualParsed.status === 'ok') dualParsed.status = 'recovered';
+                    } else {
+                        throw new Error(`${firstIncomplete} 精简重试后仍然不完整：${dualIncompleteMessage(retryParsed, dualQuestions)}`);
+                    }
+                } catch (retryError) {
+                    if (String(retryError?.message || '').startsWith(firstIncomplete)) throw retryError;
+                    throw new Error(`${firstIncomplete} 精简重试失败：${dualApiFailureMessage(retryError)}`);
+                }
+            }
+
+            if (!dualParsedIsComplete(dualParsed, dualQuestions)) {
+                throw new Error(dualIncompleteMessage(dualParsed, dualQuestions));
+            }
             if (dualParsed.status === 'missing') {
                 dualParsed.status = 'format_error';
                 dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stscdev_self_check> 结构。');
@@ -2509,7 +2697,7 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
             pendingRun.previousReview = previousReview;
             pendingRun.mode = 'dual_api';
             applyDualApiMainPrompt(dualQuestions, dualParsed, rawCheck, settings);
-            if (dualParsed.status !== 'ok') {
+            if (dualParsed.status === 'format_error') {
                 toastr.warning('独立自检API已经返回结果，但格式不完整。本轮仍会把结果交给酒馆主API，并在自检记录中标记格式问题。', '墨提斯之镜 DEV', { timeOut: 7000 });
             }
         } catch (error) {
@@ -3105,6 +3293,19 @@ function renderSettingsTab() {
                 <div id="stscdev_dual_custom_turns_wrap" class="stscdev-field ${customTurnsVisible ? '' : 'stscdev-field-disabled'}">
                     <label>自定义轮数</label>
                     <input id="stscdev_dual_custom_turns" class="text_pole" type="number" min="1" max="100" value="${Math.round(dual.customTurns)}" ${customTurnsVisible ? '' : 'disabled'}>
+                </div>
+            </div>
+
+            <div class="stscdev-grid-2" style="margin-top:10px">
+                <div class="stscdev-field">
+                    <label>单次请求超时</label>
+                    <input id="stscdev_dual_timeout_seconds" class="text_pole" type="number" min="60" max="300" step="10" value="${Math.round(dual.timeoutSeconds)}">
+                    <div class="stscdev-muted">单位：秒，默认150秒。自动重试会改用精简上下文，并最多再等待60秒。</div>
+                </div>
+                <div class="stscdev-field">
+                    <label>瞬时错误补救</label>
+                    <label class="checkbox_label"><input id="stscdev_dual_retry_transient" type="checkbox" ${dual.retryTransient ? 'checked' : ''}> 自动精简重试一次</label>
+                    <div class="stscdev-muted">仅用于超时、限流、服务器异常、网络中断及不完整回答；认证失败不会重试。</div>
                 </div>
             </div>
 
@@ -4341,8 +4542,17 @@ function bindUiEvents() {
         $(this).text(showing ? '显示' : '隐藏');
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_dual_max_tokens', function () {
-        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 2000);
+        getUiSettings().dualApi.maxTokens = clampNumber(this.value, 256, 12000, 4096);
         this.value = Math.round(getUiSettings().dualApi.maxTokens);
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_timeout_seconds', function () {
+        getUiSettings().dualApi.timeoutSeconds = clampNumber(this.value, 60, 300, 150);
+        this.value = Math.round(getUiSettings().dualApi.timeoutSeconds);
+        markDirty();
+    });
+    $('#stscdev_manager_overlay').on('change', '#stscdev_dual_retry_transient', function () {
+        getUiSettings().dualApi.retryTransient = this.checked;
         markDirty();
     });
     $('#stscdev_manager_overlay').on('change', '#stscdev_dual_context_mode', function () {
