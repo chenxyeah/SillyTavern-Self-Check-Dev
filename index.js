@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.18';
+const STSC_VERSION = '0.4.0-beta.19';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -28,11 +28,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-26',
-    title: '资料库自检开关状态修复',
+    title: '插件内立即更新按钮修复',
     changes: Object.freeze([
-        '关闭资料库条目时，不再清除“自动加入自检问答末尾”的选择。',
-        '资料库关闭期间仍不会注入资料或添加自检问题；重新启用后会恢复此前选择。',
-        '新导入的资料库继续保持关闭且不自动加入自检，避免未经确认就参与生成。',
+        '修复版本弹窗中的“立即更新”和“立即检查更新”按钮点击后没有反应的问题。',
+        '检查或安装更新时，版本弹窗会同步显示当前进度和错误信息。',
+        '更新成功后仍会自动刷新页面，不必再前往 SillyTavern 扩展管理页面。',
     ]),
 });
 
@@ -3439,7 +3439,7 @@ function renderUpdatesTab() {
             <div class="stscdev-update-card is-available">
                 <div class="stscdev-update-card-head">
                     <div><div class="stscdev-update-kicker">发现新版本</div><div class="stscdev-update-version">${remoteVersionLabel}</div></div>
-                    <button class="menu_button stscdev-primary-button" type="button" data-action="update-plugin-now"><i class="fa-solid fa-download"></i> 立即更新</button>
+                    <button class="menu_button stscdev-primary-button" type="button" data-action="update-plugin-now" data-dialog-action="update-plugin-now"><i class="fa-solid fa-download"></i> 立即更新</button>
                 </div>
                 ${remote.title ? `<div class="stscdev-release-title">${escapeHtml(remote.title)}</div>` : ''}
                 ${releaseChangesHtml(remote)}
@@ -3456,7 +3456,7 @@ function renderUpdatesTab() {
             <div class="stscdev-section-title">当前版本</div>
             <div class="stscdev-current-version-row">
                 <div><div class="stscdev-update-kicker">已安装</div><div class="stscdev-update-version">v${escapeHtml(STSC_RELEASE_INFO.version)}</div></div>
-                <button class="menu_button" type="button" data-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
+                <button class="menu_button" type="button" data-action="check-plugin-update" data-dialog-action="check-plugin-update"><i class="fa-solid fa-rotate"></i> 立即检查更新</button>
             </div>
             <div class="stscdev-release-title">${escapeHtml(STSC_RELEASE_INFO.title)}</div>
             <div class="stscdev-muted">发布日期：${escapeHtml(STSC_RELEASE_INFO.releasedAt)}</div>
@@ -3472,6 +3472,9 @@ function renderUpdatesTab() {
             <div class="stscdev-muted" style="margin-top:6px">没有新版本时不会弹窗。发现更新后可直接在本页面完成更新，更新说明可随时回来查看。</div>
         </div>
     `);
+    const versionDialogOpen = !$('#stscdev_dialog_overlay').hasClass('stscdev-hidden')
+        && $('#stscdev_dialog_title').text() === '版本更新';
+    if (versionDialogOpen) $('#stscdev_dialog_body').html($('#stscdev_tab_updates').html());
 }
 
 function renderHeaderUpdateBadge() {
