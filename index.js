@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.17';
+const STSC_VERSION = '0.4.0-beta.18';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -28,13 +28,11 @@ const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-26',
-    title: '双API超时与解析可靠性修复',
+    title: '资料库自检开关状态修复',
     changes: Object.freeze([
-        '自检API超时改为可配置，并对超时、限流、服务器异常与网络中断执行一次精简重试。',
-        '自检问题改用短题号，解析器兼容原ID、题号、输出顺序、未加引号属性与转义XML。',
-        '旧版默认2000 Token自动迁移为4096 Token，降低多题回答在结尾被截断的概率。',
-        '0题或关键答案缺失时不再把空结果交给正文API；自动重试失败后按设置安全回退。',
-        '已成功修复的结束标签不再记为警告，API日志会保留脱敏后的实际错误与HTTP状态。',
+        '关闭资料库条目时，不再清除“自动加入自检问答末尾”的选择。',
+        '资料库关闭期间仍不会注入资料或添加自检问题；重新启用后会恢复此前选择。',
+        '新导入的资料库继续保持关闭且不自动加入自检，避免未经确认就参与生成。',
     ]),
 });
 
@@ -697,7 +695,6 @@ function normalizeReference(reference) {
     reference.depth = clampNumber(reference.depth, 0, 20, defaults.depth);
     reference.addToCheck = Boolean(reference.addToCheck);
     reference.autoQuestion = String(reference.autoQuestion || defaults.autoQuestion);
-    if (!reference.enabled) reference.addToCheck = false;
 }
 
 function applyReferenceTypeDefaults(reference, nextType, { preserveCustomQuestion = true } = {}) {
@@ -4446,7 +4443,6 @@ function bindUiEvents() {
 
         if (field === 'enabled') {
             reference.enabled = this.checked;
-            if (!reference.enabled) reference.addToCheck = false;
             markDirty();
             renderReferencesTab();
             renderCompact();
