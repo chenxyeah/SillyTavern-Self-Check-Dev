@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.20';
+const STSC_VERSION = '0.4.0-beta.21';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -22,18 +22,26 @@ const STSC_REFERENCE_IMPORT_MAX_BYTES = 16 * 1024 * 1024;
 const STSC_BUILTIN_GENERAL_KEY = 'default-general-core-v1';
 const STSC_BUILTIN_GENERAL_NAME = '默认通用自检';
 const STSC_UPDATE_CHECK_INTERVAL_MS = 30 * 60 * 1000;
-const STSC_REMOTE_MANIFEST_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/manifest.json';
-const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/version.json';
+const STSC_REMOTE_MANIFEST_URLS = Object.freeze([
+    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/manifest.json',
+    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check-Dev@main/manifest.json',
+    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check-Dev/contents/manifest.json?ref=main',
+]);
+const STSC_REMOTE_RELEASE_URLS = Object.freeze([
+    'https://raw.githubusercontent.com/chenxyeah/SillyTavern-Self-Check-Dev/main/version.json',
+    'https://cdn.jsdelivr.net/gh/chenxyeah/SillyTavern-Self-Check-Dev@main/version.json',
+    'https://api.github.com/repos/chenxyeah/SillyTavern-Self-Check-Dev/contents/version.json?ref=main',
+]);
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
     releasedAt: '2026-08-28',
-    title: '复盘协议与YAML强力规范优化',
+    title: '更新检查与大白话运行日志优化',
     changes: Object.freeze([
-        '未开启复盘时只要求本轮自检；开启且存在上一轮时，固定输出“上一轮复盘＋本轮自检”。',
-        '精简重试继续携带压缩后的复盘内容，并对模型漏掉复盘标签的情况执行一次补救。',
-        '浮窗与运行日志会区分首轮等待、退回单API和模型未返回复盘，不再统一提示至少两轮。',
-        '强力规范改为简洁YAML并以System角色注入，不再向正文模型暴露通用预设或角色预设名称。',
+        '更新检查改为 GitHub 原地址、备用 CDN 与 GitHub API 多路尝试，单一路径连不上时仍可继续检查。',
+        '检查失败时会写明哪一步没有成功，并可直接尝试更新或打开酒馆扩展页面。',
+        '每轮生成都会记录角色卡、单/双API模式、自检完成数量、正文是否输出以及复盘结果。',
+        '自检API、格式与更新错误改成大白话说明，明确告诉用户发生了什么以及应该怎么处理。',
     ]),
 });
 
@@ -173,6 +181,8 @@ let gitUpdateAvailable = false;
 let latestRemoteReleaseInfo = null;
 let updateCheckState = 'idle';
 let updateCheckError = '';
+let updateCheckDiagnostics = [];
+let installedExtensionGitState = 'unknown';
 let lastRuntimeUpdateCheckAt = 0;
 let officialConflictWarned = false;
 let dualApiModels = [];
@@ -193,6 +203,7 @@ function compactRuntimeLogMessage(level, stage, message, handling = '') {
     const source = String(message || '');
     const handlingText = String(handling || '');
     if (stageText === '自检解析') {
+        if (/^角色卡“/.test(source)) return source.length > 500 ? `${source.slice(0, 500)}…` : source;
         const countMatch = handlingText.match(/(\d+)\s*\/\s*(\d+)/);
         if (countMatch && countMatch[1] !== countMatch[2]) return `自检回答不完整：识别到 ${countMatch[1]}/${countMatch[2]} 题。`;
         if (/结束标签缺失|没有正确闭合|自动补全/.test(source)) return '自检标签不完整，插件已自动修复。';
@@ -200,11 +211,13 @@ function compactRuntimeLogMessage(level, stage, message, handling = '') {
         return '自检输出格式不完整。';
     }
     if (stageText === '自检API') {
-        if (/超时|超过\s*\d+\s*秒/.test(source)) return source.length > 500 ? `${source.slice(0, 500)}…` : source;
-        if (/401|403|密钥|认证|授权/.test(source)) return `自检API认证失败：${source}`.slice(0, 500);
-        return `自检API调用失败：${source || '未知错误'}`.slice(0, 500);
+        if (/^角色卡“/.test(source)) return source.length > 600 ? `${source.slice(0, 600)}…` : source;
+        if (/超时|超过\s*\d+\s*秒/.test(source)) return `自检API等了很久仍没有回答。${source}`.slice(0, 600);
+        if (/401|403|密钥|认证|授权/.test(source)) return `自检API拒绝了请求，请检查API密钥和账号权限。${source}`.slice(0, 600);
+        if (/429|限流|请求过多|额度/.test(source)) return `自检API当前太忙、请求次数过多或额度不足。${source}`.slice(0, 600);
+        return `没有成功调用自检API：${source || '没有收到具体原因。'}`.slice(0, 600);
     }
-    return source.length > 180 ? `${source.slice(0, 180)}…` : source;
+    return source.length > 600 ? `${source.slice(0, 600)}…` : source;
 }
 
 function addRuntimeLog(level, stage, message, handling = '') {
@@ -215,6 +228,67 @@ function addRuntimeLog(level, stage, message, handling = '') {
     settings.logs = settings.logs.slice(0, STSC_LOG_LIMIT);
     saveSettings();
     renderLogBadge();
+}
+
+function plainSelfCheckIssue(issue) {
+    const text = String(issue || '');
+    if (/酒馆主API.*重复输出|意外重复输出/.test(text)) return '正文AI把插件内部自检也写进了正文，插件已经自动删掉。';
+    if (/结束标签缺失|没有正确闭合|自动补全/.test(text)) return '自检内容的结尾格式没有写完整，插件已经自动补齐。';
+    if (/没有按要求输出.*stscdev_self_check|没有检测到|没有输出|未输出|完全没有/.test(text)) return 'AI没有输出插件能够识别的自检内容。';
+    if (/缺少回答|必要依据|回答不完整|格式不完整/.test(text)) return 'AI返回了自检内容，但有题目漏答或缺少必须提供的依据。';
+    return text.replace(/<\/?stscdev_[^>]+>/gi, '自检格式标记').replace(/<\/?(?:item|answer|evidence)[^>]*>/gi, '');
+}
+
+function runtimeCharacterLabel(latest) {
+    const name = String(latest?.characterName || '').trim() || '未识别角色';
+    return `角色卡“${name}”`;
+}
+
+function addGenerationResultLog(latest, visibleBody = '') {
+    if (!latest) return;
+    const character = runtimeCharacterLabel(latest);
+    const mode = latest.mode === 'dual_api' ? '双API' : '单API';
+    const answered = Math.max(0, Number(latest.answeredCount) || 0);
+    const expected = Math.max(0, Number(latest.expectedCount) || 0);
+    const countText = expected ? `${answered}/${expected} 题` : `${answered} 题`;
+    const hasBody = Boolean(String(visibleBody || '').trim());
+    const formatDetails = (latest.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
+    const handlingParts = [`本轮使用${mode}模式。`];
+    let level = 'info';
+    let message = '';
+
+    if (!hasBody) {
+        level = 'error';
+        message = `${character}：AI这次没有生成可显示的正文。自检识别到 ${countText}。`;
+        handlingParts.push('请重新生成；如果反复出现，请检查主API连接和模型是否正常。');
+    } else if (latest.status === 'missing' || answered === 0) {
+        level = 'warning';
+        message = `${character}：正文已经输出，但没有找到插件要求的自检回答。`;
+        handlingParts.push('正文已保留；本轮没有可用的自检结论。请检查当前模式、提示词是否被其他预设覆盖，或查看前后的API记录。');
+    } else if (latest.status === 'format_error' || (expected && answered < expected)) {
+        level = 'warning';
+        message = `${character}：收到了自检内容，但只完整识别到 ${countText}；正文已经输出。`;
+        handlingParts.push('插件已保留能够识别的答案。');
+        if (formatDetails.length) handlingParts.push(`具体情况：${formatDetails.join('；')}`);
+    } else if (latest.status === 'recovered') {
+        message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
+        handlingParts.push('AI最初的格式有小问题，插件已经自动修好，无需手动处理。');
+    } else {
+        message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
+        handlingParts.push('本轮运行正常，无需处理。');
+    }
+
+    const review = latest.previousReview;
+    if (review?.status === 'missing') {
+        if (level === 'info') level = 'warning';
+        handlingParts.push('本轮自检正常，但AI漏掉了上一轮复盘；插件下一轮还会继续尝试。');
+    } else if (review?.issues?.length) {
+        handlingParts.push(`上一轮复盘发现 ${review.issues.length} 条疑似问题，可到“复盘线索”中查看和选择。`);
+    } else if (review?.status === 'ok') {
+        handlingParts.push('上一轮复盘也已完成，没有发现明显问题。');
+    }
+
+    addRuntimeLog(level, '本轮结果', message, handlingParts.join(' '));
 }
 
 function ctx() {
@@ -2188,12 +2262,34 @@ function applyDualApiMainPrompt(questions, parsed, rawCheck, settings) {
 }
 
 function dualApiFailureMessage(error) {
-    const message = compactPromptText(error?.message || error || '未知错误');
-    const details = [];
-    if (error?.httpStatus && !message.includes(`HTTP ${error.httpStatus}`)) details.push(`HTTP ${error.httpStatus}`);
-    if (Number.isFinite(error?.elapsedMs)) details.push(`最后一次请求耗时 ${(error.elapsedMs / 1000).toFixed(1)} 秒`);
-    if (error?.attempts > 1 && !message.includes('自动精简重试')) details.push(`共尝试 ${error.attempts} 次`);
-    return details.length ? `${message}（${details.join('；')}）` : message;
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    const seconds = Number.isFinite(error?.elapsedMs) ? Math.max(1, Math.round(error.elapsedMs / 1000)) : 0;
+    const retried = Number(error?.attempts) > 1 || /重试/.test(raw);
+    let message = '';
+
+    if (/格式不完整|识别到\s*\d+\/\d+|缺少回答|必要依据/.test(raw)) {
+        message = '自检API有返回内容，但题目没有答全，或缺少必须提供的依据。';
+    } else if (/超时|timeout|timed out|AbortError|超过\s*\d+\s*秒/i.test(raw)) {
+        message = `等待自检API${seconds ? `约 ${seconds} 秒` : '很久'}仍没有收到回答，通常是接口太慢或网络不稳定。`;
+    } else if (status === 401 || status === 403 || /密钥|认证|授权|unauthori|forbidden/i.test(raw)) {
+        message = `自检API拒绝了请求${status ? `（返回 ${status}）` : ''}，通常是API密钥错误、已经失效，或账号没有使用该模型的权限。`;
+    } else if (status === 404) {
+        message = '没有找到自检API地址（返回 404），请检查接口地址是否填对，以及地址末尾是否需要 /v1。';
+    } else if (status === 429 || /限流|请求过多|rate.?limit|quota|额度/i.test(raw)) {
+        message = '自检API暂时拒绝了请求（返回 429），通常是请求太频繁、并发过高或账号额度不足。';
+    } else if (status >= 500 || /bad gateway|service unavailable|gateway timeout/i.test(raw)) {
+        message = `自检API服务端出错${status ? `（返回 ${status}）` : ''}，不是插件格式问题；可以稍后重试或更换接口线路。`;
+    } else if (/Failed to fetch|NetworkError|fetch failed|network|ECONN|ENOTFOUND|连接失败/i.test(raw)) {
+        message = '没有连接上自检API，请检查网络、接口地址以及反向代理是否可用。';
+    } else if (/model|模型/i.test(raw)) {
+        message = `自检API没有接受当前模型设置。请重新获取模型列表并确认所选模型仍然可用。原始提示：${raw}`;
+    } else {
+        message = `自检API没有成功完成请求。接口给出的提示是：${raw}`;
+    }
+
+    if (retried) message += ' 插件已经自动精简内容并重试过一次，仍然没有成功。';
+    return message;
 }
 
 function dualParsedMissingRequirements(parsed, questions) {
@@ -2531,14 +2627,7 @@ async function handleMessageReceived(data) {
 
     refreshMessageDom(messageId, message);
     await saveLatestResult(latest);
-    if (latest.formatIssues?.length) {
-        addRuntimeLog('warning', '自检解析', latest.formatIssues.join('；'), `本轮已识别 ${latest.answeredCount}/${latest.expectedCount} 题；异常内容已在当前状态中标记。`);
-    }
-    if (latest.previousReview?.status === 'missing') {
-        addRuntimeLog('warning', 'AI复盘', latest.previousReview.reason || '本轮没有读取到上一轮复盘结果。', '本轮自检与正文仍正常完成；下一轮会再次尝试复盘。');
-    } else if (latest.previousReview?.issues?.length) {
-        addRuntimeLog('info', 'AI复盘', `发现 ${latest.previousReview.issues.length} 条上一轮疑似问题。`, '已保存到“复盘线索”；只有用户勾选的内容才会影响下一轮。');
-    }
+    addGenerationResultLog(latest, message.mes || '');
 
     try {
         await context.saveChat?.();
@@ -2561,6 +2650,9 @@ function onGenerationEnded() {
     // 极端情况下没有收到最终消息事件，避免运行状态永久残留。
     setTimeout(() => {
         if (pendingRun && Date.now() - pendingRun.startedAt > 4500) {
+            const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
+            const mode = pendingRun.mode === 'dual_api' ? '双API' : '单API';
+            addRuntimeLog('error', '本轮结果', `${character}：本轮生成已经结束，但插件没有收到可保存的AI正文。`, `本轮原本使用${mode}模式。请重新生成；如果连续发生，请检查主API连接和酒馆控制台。`);
             pendingRun = null;
         }
     }, 5000);
@@ -2568,6 +2660,10 @@ function onGenerationEnded() {
 
 function onGenerationStopped() {
     clearRuntimePrompts();
+    if (pendingRun) {
+        const character = runtimeCharacterLabel({ characterName: pendingRun.characterName || '' });
+        addRuntimeLog('warning', '本轮结果', `${character}：本轮生成在完成前被停止，没有形成完整结果。`, '如果这是你手动停止的，可以忽略；如果不是，请检查主API连接是否中断。');
+    }
     pendingRun = null;
     dualApiBusy = false;
 }
@@ -2623,6 +2719,7 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
     pendingRun = {
         mode: settings.mode,
         questions: clone(questions),
+        characterName: getCurrentEntity()?.name || '',
         startedAt: Date.now(),
         generationType: type,
         dualCheck: '',
@@ -2726,14 +2823,15 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
         } catch (error) {
             console.error('[STSC DEV] 双API自检调用失败：', error);
             const reason = dualApiFailureMessage(error);
+            const character = runtimeCharacterLabel({ characterName: getCurrentEntity()?.name || '' });
             if (settings.dualApi.failureMode === 'fallback_single') {
-                addRuntimeLog('warning', '自检API', reason, '已自动退回单API调用。');
+                addRuntimeLog('warning', '自检API', `${character}：${reason}`, '插件已经自动改用单API继续生成，本轮不会直接中断。');
                 pendingRun.mode = 'single';
                 pendingRun.questions = clone(questions);
                 setRuntimePrompt('stscdev_main', buildSinglePrompt(questions), settings.injection);
                 toastr.warning(`独立自检API调用失败，已自动退回单API模式。原因：${reason}`, '墨提斯之镜 DEV', { timeOut: 9000 });
             } else {
-                addRuntimeLog('error', '自检API', reason, '已停止本轮生成。');
+                addRuntimeLog('error', '自检API', `${character}：${reason}`, '当前设置要求双API失败时停止，因此本轮生成已经停止。');
                 abort?.(true);
                 pendingRun = null;
                 clearRuntimePrompts();
@@ -3472,7 +3570,21 @@ function renderUpdatesTab() {
                 <div class="stscdev-muted" style="margin-top:8px">更新完成后页面会自动刷新。更新前请先保存当前未保存的插件设置。</div>
             </div>`;
     } else if (updateCheckState === 'error') {
-        remoteHtml = `<div class="stscdev-update-card is-error"><b>暂时无法检查更新</b><div class="stscdev-muted">${escapeHtml(updateCheckError || '网络或扩展更新接口不可用。')}</div></div>`;
+        const diagnosticHtml = updateCheckDiagnostics.length
+            ? `<ul class="stscdev-release-change-list">${updateCheckDiagnostics.map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+            : '';
+        const directButton = installedExtensionGitState === 'non_git'
+            ? ''
+            : '<button class="menu_button stscdev-primary-button" type="button" data-action="update-plugin-direct" data-dialog-action="update-plugin-direct"><i class="fa-solid fa-download"></i> 跳过检查，直接尝试更新</button>';
+        remoteHtml = `<div class="stscdev-update-card is-error">
+            <b>这次没有查到远程版本</b>
+            <div style="margin-top:7px">${escapeHtml(updateCheckError || '插件没有从远程网络或酒馆自身接口拿到更新结果。')}</div>
+            ${diagnosticHtml}
+            <div class="stscdev-toolbar" style="margin-top:10px">
+                ${directButton}
+                <button class="menu_button" type="button" data-action="open-sillytavern-extensions" data-dialog-action="open-sillytavern-extensions"><i class="fa-solid fa-puzzle-piece"></i> 打开酒馆扩展页面</button>
+            </div>
+        </div>`;
     } else {
         remoteHtml = '<div class="stscdev-update-card is-latest"><b>当前已经是最新版本。</b><div class="stscdev-muted">插件启动、打开管理器以及后台定时检查时都会自动检测新版本。</div></div>';
     }
@@ -3520,7 +3632,7 @@ function openVersionDialog() {
 }
 
 function runtimeLogHtml(item) {
-    const labels = { error: '错误', warning: '警告', info: '记录' };
+    const labels = { error: '失败', warning: '需要留意', info: '正常' };
     return `<article class="stscdev-log-item is-${escapeHtml(item.level || 'info')}" data-log-id="${escapeHtml(item.id)}">
         <div class="stscdev-log-head"><b>${escapeHtml(labels[item.level] || '记录')}｜${escapeHtml(item.stage || '运行')}</b><time>${new Date(item.timestamp).toLocaleString()}</time></div>
         <div>${escapeHtml(item.message || '')}</div>${item.handling ? `<div class="stscdev-muted">处理：${escapeHtml(item.handling)}</div>` : ''}
@@ -3533,8 +3645,8 @@ function openLogDialog() {
     settings.logLastViewedAt = Date.now();
     saveSettings();
     renderLogBadge();
-    const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stscdev-empty">运行正常，暂无异常记录。</div>';
-    openDialog('运行日志', `<div class="stscdev-log-summary">本地长期保存，最多保留最近 ${STSC_LOG_LIMIT} 条；不会记录 API 密钥。</div><div class="stscdev-log-list">${list}</div>`,
+    const list = settings.logs.length ? settings.logs.map(runtimeLogHtml).join('') : '<div class="stscdev-empty">还没有运行记录。完成一次角色回复或手动检查更新后，这里会显示结果。</div>';
+    openDialog('运行日志', `<div class="stscdev-log-summary">成功、部分完成和失败都会记录。日志会写明时间、角色卡、运行模式、完成题数、正文与API情况；本地最多保留最近 ${STSC_LOG_LIMIT} 条，且不会记录API密钥。</div><div class="stscdev-log-list">${list}</div>`,
         '<button class="menu_button" type="button" data-dialog-action="clear-runtime-cache">清理缓存</button><button class="menu_button" type="button" data-dialog-action="export-logs">导出日志</button><button class="menu_button stscdev-danger-button" type="button" data-dialog-action="ask-clear-logs">清除日志</button>');
 }
 
@@ -4712,11 +4824,17 @@ function bindUiEvents() {
             openBatchReferenceExportDialog();
             return;
         } else if (action === 'check-plugin-update') {
-            await checkForPluginUpdate({ force: true });
+            await checkForPluginUpdate({ force: true, userInitiated: true });
             renderUpdatesTab();
             return;
         } else if (action === 'update-plugin-now') {
             await updatePluginFromManager();
+            return;
+        } else if (action === 'update-plugin-direct') {
+            await updatePluginFromManager({ skipCheck: true });
+            return;
+        } else if (action === 'open-sillytavern-extensions') {
+            openExtensionManagerForUpdate();
             return;
         } else if (action === 'open-extension-manager') {
             openVersionDialog();
@@ -4977,11 +5095,20 @@ function bindUiEvents() {
             return;
         }
         if (action === 'check-plugin-update') {
-            void checkForPluginUpdate({ force: true }).then(openVersionDialog);
+            void checkForPluginUpdate({ force: true, userInitiated: true }).then(openVersionDialog);
             return;
         }
         if (action === 'update-plugin-now') {
             void updatePluginFromManager();
+            return;
+        }
+        if (action === 'update-plugin-direct') {
+            void updatePluginFromManager({ skipCheck: true });
+            return;
+        }
+        if (action === 'open-sillytavern-extensions') {
+            closeDialog();
+            openExtensionManagerForUpdate();
             return;
         }
         if (action === 'export-logs') {
@@ -5136,6 +5263,12 @@ function bindUiEvents() {
 
 
 function openExtensionManagerForUpdate() {
+    if (editDirty) {
+        toastr.warning('当前还有未保存的插件设置，请先保存，再打开酒馆扩展页面。', '墨提斯之镜 DEV');
+        return;
+    }
+    closeDialog();
+    performCloseManager();
     const detailsButton = document.querySelector('#extensions_details');
     if (detailsButton) {
         detailsButton.click();
@@ -5172,16 +5305,28 @@ async function getInstalledExtensionType() {
 
 async function fetchOwnExtensionVersion(isGlobal) {
     const context = ctx();
-    const response = await fetch('/api/extensions/version', {
-        method: 'POST',
-        headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            extensionName: STSC_EXTENSION_FOLDER_NAME,
-            global: Boolean(isGlobal),
-        }),
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    return await response.json();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+        const response = await fetch('/api/extensions/version', {
+            method: 'POST',
+            headers: context?.getRequestHeaders?.() || { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                extensionName: STSC_EXTENSION_FOLDER_NAME,
+                global: Boolean(isGlobal),
+            }),
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            const detail = compactPromptText(await response.text());
+            const error = new Error(detail || `HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
+        }
+        return await response.json();
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 function compareVersions(left, right) {
@@ -5206,32 +5351,78 @@ function compareVersions(left, right) {
     return 0;
 }
 
-async function fetchRemoteManifestVersion() {
-    const separator = STSC_REMOTE_MANIFEST_URL.includes('?') ? '&' : '?';
-    const response = await fetch(`${STSC_REMOTE_MANIFEST_URL}${separator}stsc=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
+function decodeRemoteJsonPayload(payload) {
+    if (!payload || typeof payload !== 'object' || payload.encoding !== 'base64' || typeof payload.content !== 'string') return payload;
+    const binary = atob(payload.content.replace(/\s+/g, ''));
+    const bytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+    return JSON.parse(new TextDecoder('utf-8').decode(bytes));
+}
+
+async function fetchRemoteJsonUrl(url) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    const separator = url.includes('?') ? '&' : '?';
+    try {
+        const response = await fetch(`${url}${separator}stsc=${Date.now()}`, {
+            method: 'GET',
+            cache: 'no-store',
+            headers: { Accept: 'application/json, application/vnd.github+json' },
+            signal: controller.signal,
+        });
+        if (!response.ok) {
+            const error = new Error(`HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
+        }
+        return decodeRemoteJsonPayload(await response.json());
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+function fetchRemoteJsonFromMirrors(urls, label) {
+    return new Promise((resolve, reject) => {
+        const failures = [];
+        let remaining = urls.length;
+        for (const url of urls) {
+            fetchRemoteJsonUrl(url).then(resolve).catch(error => {
+                failures.push(error);
+                remaining -= 1;
+                if (remaining === 0) {
+                    const combined = new Error(`${label}的 ${urls.length} 个网络地址都没有连接成功。`);
+                    combined.causes = failures;
+                    reject(combined);
+                }
+            });
+        }
     });
-    if (!response.ok) throw new Error(`远程 manifest HTTP ${response.status}`);
-    const manifest = await response.json();
+}
+
+function plainUpdateFailureReason(error) {
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    if (/AbortError|aborted|超时|timeout/i.test(raw)) return '等待超时，网络或酒馆服务没有及时回答';
+    if (/Failed to fetch|NetworkError|fetch failed|network|ECONN|ENOTFOUND/i.test(raw)) return '没有连接成功，可能是网络暂时无法访问该地址';
+    if (status === 401 || status === 403) return `请求被拒绝（${status}），可能是权限或网络代理限制`;
+    if (status === 404) return '当前酒馆没有这个检查接口，或插件目录没有找到（404）';
+    if (status >= 500) return `酒馆或远程服务内部出错（${status}）`;
+    if (/Git repository|not a Git|不是.*Git/i.test(raw)) return '当前插件不是通过 Git 仓库安装，酒馆无法直接拉取更新';
+    if (/\d+ 个网络地址都没有连接成功/.test(raw)) return raw;
+    return raw || '没有收到具体原因';
+}
+
+async function fetchRemoteManifestVersion() {
+    const manifest = await fetchRemoteJsonFromMirrors(STSC_REMOTE_MANIFEST_URLS, '远程版本号');
     const version = String(manifest?.version || '').trim();
-    if (!version) throw new Error('远程 manifest 缺少版本号');
+    if (!version) throw new Error('远程版本文件已经收到，但里面没有版本号。');
     return version;
 }
 
 
 async function fetchRemoteReleaseInfo() {
-    const separator = STSC_REMOTE_RELEASE_URL.includes('?') ? '&' : '?';
-    const response = await fetch(`${STSC_REMOTE_RELEASE_URL}${separator}stsc=${Date.now()}`, {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { Accept: 'application/json' },
-    });
-    if (!response.ok) throw new Error(`远程版本说明 HTTP ${response.status}`);
-    const info = await response.json();
+    const info = await fetchRemoteJsonFromMirrors(STSC_REMOTE_RELEASE_URLS, '远程更新说明');
     const version = String(info?.version || '').trim();
-    if (!version) throw new Error('远程版本说明缺少版本号');
+    if (!version) throw new Error('远程更新说明已经收到，但里面没有版本号。');
     return {
         version,
         releasedAt: String(info?.releasedAt || ''),
@@ -5301,14 +5492,35 @@ function showPluginUpdateNotice(remoteVersion = '', releaseInfo = null, { gitOnl
     );
 }
 
-async function updatePluginFromManager() {
+function plainExtensionUpdateFailure(error) {
+    const raw = compactPromptText(error?.message || error || '没有收到具体原因');
+    const status = Number(error?.httpStatus) || Number(raw.match(/HTTP\s*(\d{3})/i)?.[1]) || 0;
+    if (/not a Git|Git repository|不是.*Git/i.test(raw)) return '当前插件文件夹不是通过 GitHub 仓库安装的，所以酒馆不能直接拉取更新。请到酒馆扩展页面删除后，再用 DEV 仓库链接重新安装。';
+    if (status === 401 || status === 403) return '酒馆拒绝了更新操作。若插件安装在全局扩展目录，请使用管理员账号更新。';
+    if (status === 404) return '酒馆没有找到这个插件目录，可能是插件文件夹名称被改过，或当前酒馆版本不支持这个更新接口。';
+    if (status >= 500) return `酒馆没有成功拉取插件文件（返回 ${status}）。常见原因是插件不是 Git 安装、GitHub 暂时连不上，或插件目录里的 Git 状态异常。`;
+    if (/AbortError|timeout|超时/i.test(raw)) return '更新等待超时，酒馆没有及时从 GitHub 拉到文件。请稍后重试或在扩展页面更新。';
+    if (/Failed to fetch|NetworkError|network|连接/i.test(raw)) return '更新时没有连接成功，请检查酒馆服务器到 GitHub 的网络。';
+    return `酒馆没有完成更新。酒馆给出的提示是：${raw}`;
+}
+
+async function updatePluginFromManager({ skipCheck = false } = {}) {
     if (updateCheckInFlight || updateCheckState === 'updating') return;
     if (editDirty) {
         toastr.warning('当前还有未保存的修改，请先点击“保存更改”再更新插件。', '墨提斯之镜 DEV');
         return;
     }
-    if (updateCheckState !== 'available' && !gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
-        await checkForPluginUpdate({ force: true });
+    if (installedExtensionGitState === 'non_git') {
+        updateCheckState = 'error';
+        updateCheckError = '当前插件不是通过 GitHub 仓库安装的，酒馆无法在插件内直接更新。';
+        updateCheckDiagnostics = ['请打开酒馆扩展页面，删除当前 DEV 插件，再使用 DEV 仓库链接重新安装；插件设置通常保存在酒馆设置中，不会因为重装插件文件而清空。'];
+        addRuntimeLog('error', '插件更新', updateCheckError, updateCheckDiagnostics[0]);
+        renderUpdatesTab();
+        toastr.error(updateCheckError, '无法直接更新', { timeOut: 7000 });
+        return;
+    }
+    if (!skipCheck && updateCheckState !== 'available' && !gitUpdateAvailable && (!updateAvailableVersion || compareVersions(updateAvailableVersion, STSC_VERSION) <= 0)) {
+        await checkForPluginUpdate({ force: true, userInitiated: true });
         if (updateCheckState !== 'available') return;
     }
 
@@ -5329,17 +5541,30 @@ async function updatePluginFromManager() {
             }),
         });
         if (!response.ok) {
-            const text = await response.text();
-            throw new Error(text || `HTTP ${response.status}`);
+            const detail = compactPromptText(await response.text());
+            const error = new Error(detail || `HTTP ${response.status}`);
+            error.httpStatus = response.status;
+            throw error;
         }
         const result = await response.json();
         if (result?.isUpToDate) {
-            updateCheckState = 'available';
-            toastr.warning('远程版本号较新，但 Git 未拉取到新提交。请确认插件安装分支为 main，或重新安装插件。', '插件未能更新');
+            if (skipCheck) {
+                updateCheckState = 'latest';
+                updateCheckError = '';
+                updateCheckDiagnostics = [];
+                clearPluginUpdateNotice();
+                addRuntimeLog('info', '插件更新', '酒馆已经直接检查过插件文件，当前没有可拉取的新提交。', '当前插件已经是 Git 仓库能获取到的最新内容。');
+                toastr.success('酒馆已经直接检查过，当前没有可拉取的新提交。', '插件已经是最新状态');
+            } else {
+                updateCheckState = 'available';
+                addRuntimeLog('warning', '插件更新', '远程版本号显示有更新，但酒馆没有拉取到新提交。', '请确认插件安装分支是 main；如果仍然如此，请到酒馆扩展页面重新安装 DEV 仓库。');
+                toastr.warning('远程版本号显示有更新，但酒馆没有拉取到新提交。请确认插件安装分支为 main，或重新安装插件。', '插件未能更新');
+            }
             return;
         }
 
         const installedTargetVersion = gitUpdateAvailable ? '' : updateAvailableVersion;
+        addRuntimeLog('info', '插件更新', `插件文件已经成功更新${installedTargetVersion ? `到 v${installedTargetVersion}` : '到远程最新提交'}。`, '页面会自动刷新并加载新版本。');
         clearPluginUpdateNotice();
         toastr.success(`已拉取新版本${installedTargetVersion ? ` v${installedTargetVersion}` : ''}，页面即将刷新。`, '插件更新成功', {
             timeOut: 1400,
@@ -5348,7 +5573,9 @@ async function updatePluginFromManager() {
         setTimeout(() => window.location.reload(), 900);
     } catch (error) {
         updateCheckState = 'error';
-        updateCheckError = error?.message || String(error || '未知错误');
+        updateCheckError = plainExtensionUpdateFailure(error);
+        updateCheckDiagnostics = ['可以稍后重试；也可以打开酒馆扩展页面使用酒馆自带的更新按钮。'];
+        addRuntimeLog('error', '插件更新', updateCheckError, updateCheckDiagnostics[0]);
         console.error('[STSC] 插件内更新失败：', error);
         toastr.error(updateCheckError, '插件更新失败', { timeOut: 6000 });
     } finally {
@@ -5357,7 +5584,7 @@ async function updatePluginFromManager() {
     }
 }
 
-async function checkForPluginUpdate({ force = false } = {}) {
+async function checkForPluginUpdate({ force = false, userInitiated = false } = {}) {
     if (updateCheckInFlight) return;
 
     const now = Date.now();
@@ -5366,6 +5593,7 @@ async function checkForPluginUpdate({ force = false } = {}) {
     updateCheckInFlight = true;
     updateCheckState = 'checking';
     updateCheckError = '';
+    updateCheckDiagnostics = [];
     if (initialized) renderUpdatesTab();
 
     const settings = normalizeSettings();
@@ -5387,22 +5615,48 @@ async function checkForPluginUpdate({ force = false } = {}) {
         const remoteVersion = [manifestVersion, releaseInfo?.version]
             .filter(Boolean)
             .sort((a, b) => compareVersions(b, a))[0] || '';
+        const gitData = gitResult.status === 'fulfilled' ? gitResult.value : null;
+        installedExtensionGitState = gitData?.currentCommitHash
+            ? 'git'
+            : (gitResult.status === 'fulfilled' && gitData?.isUpToDate === true ? 'non_git' : 'unknown');
         const semanticVersionHasUpdate = Boolean(remoteVersion && compareVersions(remoteVersion, STSC_VERSION) > 0);
-        const gitHasUpdate = gitResult.status === 'fulfilled' && gitResult.value?.isUpToDate === false;
+        const gitHasUpdate = installedExtensionGitState === 'git' && gitData?.isUpToDate === false;
+        const gitCheckUsable = installedExtensionGitState === 'git' && typeof gitData?.isUpToDate === 'boolean';
 
         latestRemoteReleaseInfo = releaseInfo;
         if (semanticVersionHasUpdate || gitHasUpdate) {
             updateCheckState = 'available';
             showPluginUpdateNotice(remoteVersion, releaseInfo, { gitOnly: gitHasUpdate && !semanticVersionHasUpdate });
-        } else if (gitResult.status === 'fulfilled' || manifestResult.status === 'fulfilled' || releaseResult.status === 'fulfilled') {
+            if (userInitiated) addRuntimeLog('info', '更新检查', `检查完成：发现新版本${remoteVersion ? ` v${remoteVersion}` : '或新的远程提交'}。`, '可以在插件的“版本更新”页面点击“立即更新”。');
+        } else if (remoteVersion || gitCheckUsable) {
             updateCheckState = 'latest';
             clearPluginUpdateNotice();
+            if (userInitiated) addRuntimeLog('info', '更新检查', `检查完成：当前插件 v${STSC_VERSION} 已经是最新版本。`, '不需要进行任何操作。');
         } else {
-            throw new Error('Git 检查、远程版本检查与版本说明检查均失败');
+            updateCheckState = 'error';
+            updateCheckError = installedExtensionGitState === 'non_git'
+                ? '远程版本地址没有连接成功，而且当前插件不是 Git 安装，酒馆也无法替它检查远程提交。'
+                : '插件已经尝试了多个远程地址和酒馆自身的检查接口，但这次都没有拿到结果。';
+            updateCheckDiagnostics = [
+                gitResult.status === 'rejected'
+                    ? `酒馆自身检查：${plainUpdateFailureReason(gitResult.reason)}`
+                    : installedExtensionGitState === 'non_git'
+                        ? '酒馆自身检查：当前插件文件夹不是 Git 安装，无法直接比较远程提交'
+                        : '酒馆自身检查：没有返回足够的信息',
+                manifestResult.status === 'rejected'
+                    ? `远程版本号：${plainUpdateFailureReason(manifestResult.reason)}`
+                    : '远程版本号：已经读取成功',
+                releaseResult.status === 'rejected'
+                    ? `远程更新说明：${plainUpdateFailureReason(releaseResult.reason)}`
+                    : '远程更新说明：已经读取成功',
+            ];
+            if (userInitiated) addRuntimeLog('warning', '更新检查', updateCheckError, `${updateCheckDiagnostics.join('；')}。可以点击“跳过检查，直接尝试更新”，或打开酒馆扩展页面。`);
         }
     } catch (error) {
         updateCheckState = 'error';
-        updateCheckError = error?.message || String(error || '未知错误');
+        updateCheckError = '检查更新时发生了意外问题，这不影响插件继续自检。';
+        updateCheckDiagnostics = [`具体情况：${plainUpdateFailureReason(error)}`];
+        if (userInitiated) addRuntimeLog('warning', '更新检查', updateCheckError, `${updateCheckDiagnostics[0]}。可以稍后重试或打开酒馆扩展页面。`);
         console.debug('[STSC] 插件更新检查失败：', error);
     } finally {
         updateCheckInFlight = false;
