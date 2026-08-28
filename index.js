@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.19';
+const STSC_VERSION = '0.4.0-beta.20';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -27,12 +27,13 @@ const STSC_REMOTE_RELEASE_URL = 'https://raw.githubusercontent.com/chenxyeah/Sil
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-08-26',
-    title: '插件内立即更新按钮修复',
+    releasedAt: '2026-08-28',
+    title: '复盘协议与YAML强力规范优化',
     changes: Object.freeze([
-        '修复版本弹窗中的“立即更新”和“立即检查更新”按钮点击后没有反应的问题。',
-        '检查或安装更新时，版本弹窗会同步显示当前进度和错误信息。',
-        '更新成功后仍会自动刷新页面，不必再前往 SillyTavern 扩展管理页面。',
+        '未开启复盘时只要求本轮自检；开启且存在上一轮时，固定输出“上一轮复盘＋本轮自检”。',
+        '精简重试继续携带压缩后的复盘内容，并对模型漏掉复盘标签的情况执行一次补救。',
+        '浮窗与运行日志会区分首轮等待、退回单API和模型未返回复盘，不再统一提示至少两轮。',
+        '强力规范改为简洁YAML并以System角色注入，不再向正文模型暴露通用预设或角色预设名称。',
     ]),
 });
 
@@ -1841,34 +1842,28 @@ function buildDualApiTemporaryContext(instructions) {
 function getReviewSource(settings = normalizeSettings()) {
     if (!settings?.dualApi?.previousReview) return null;
     const latest = getLatestResult();
-    if (!latest || latest.chatId !== getCurrentChatId()) return null;
+    if (!latest || latest.mode !== 'dual_api' || latest.chatId !== getCurrentChatId()) return null;
     const message = ctx()?.chat?.[Number(latest.messageId)];
     if (!message || message.is_user || message.is_system) return null;
     return { latest, output: String(message.mes || '').trim() };
 }
 
-function buildPreviousReviewRequest(settings) {
+function buildPreviousReviewRequest(settings, { compact = false } = {}) {
     const source = getReviewSource(settings);
     if (!source) return '';
     const answers = (source.latest.answers || []).map((item, index) => [
         `Q${index + 1}：${item.question || ''}`,
-        `A${index + 1}：${item.answer || ''}`,
-        item.evidence ? `依据：${item.evidence}` : '',
+        `A${index + 1}：${compactDualApiRetryText(item.answer || '', compact ? 1200 : 3000)}`,
+        item.evidence ? `依据：${compactDualApiRetryText(item.evidence, compact ? 800 : 2000)}` : '',
     ].filter(Boolean).join('\n')).join('\n\n');
     return `
-在回答本轮自检前，先复盘上一轮。只报告有明确文本依据的疑似问题；不要为了填满格式而虚构问题。
+在回答本轮自检前，必须先复盘上一轮。只报告有明确文本依据的疑似问题；不要为了填满格式而虚构问题。
 
 【上一轮自检】
 ${answers || '（没有可读取的上一轮自检问答）'}
 
 【上一轮实际正文】
-${source.output || '（没有可读取的上一轮正文）'}
-
-复盘必须放在本轮自检之前，格式只能是以下两种之一：
-<stscdev_previous_review><status>ok</status></stscdev_previous_review>
-或
-<stscdev_previous_review><status>warning</status><issue><type>简短类型</type><description>疑似问题</description><evidence>正文中的具体依据</evidence><suggestion>下一轮自然修复建议</suggestion></issue></stscdev_previous_review>
-有多个问题时重复 <issue>；最多3条。复盘之后仍须完整输出 <stscdev_self_check>。
+${compactDualApiRetryText(source.output || '（没有可读取的上一轮正文）', compact ? 6000 : 18000)}
 `.trim();
 }
 
@@ -1908,7 +1903,11 @@ function buildDualApiMessages(chat, questions, references, temporaryInstructions
     const selectedChat = selectDualApiChat(chat, dualForChat).map(message => compact
         ? { ...message, content: compactDualApiRetryText(message.content, 6000) }
         : message);
-    const reviewRequest = compact ? '' : buildPreviousReviewRequest(settings);
+    const reviewRequest = buildPreviousReviewRequest(settings, { compact });
+    const reviewEnabledForThisRun = Boolean(reviewRequest);
+    const requiredOutputSchema = reviewEnabledForThisRun
+        ? `<stscdev_previous_review>\n<status>ok或warning</status>\n<!-- status为warning时最多输出3个issue；ok时不要输出issue -->\n<issue><type>简短类型</type><description>疑似问题</description><evidence>上一轮正文中的具体依据</evidence><suggestion>下一轮自然修复建议</suggestion></issue>\n</stscdev_previous_review>\n<stscdev_self_check>\n<item id="q1"><answer>可独立执行的最终回答</answer></item>\n<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>\n</stscdev_self_check>`
+        : `<stscdev_self_check>\n<item id="q1"><answer>可独立执行的最终回答</answer></item>\n<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>\n</stscdev_self_check>`;
     const repairDirectives = selectedRepairDirectives();
     const systemPrompt = `
 [墨提斯之镜 DEV｜独立自检API]
@@ -1922,13 +1921,11 @@ ${compact ? '这是一次自动精简重试：只读取必要角色信息和最�
 4. 不得漏题、合并题目或改变 q1、q2 这类短题号。
 5. 对 evidence_required="true" 的问题，必须输出非空的 <evidence>，写明可核对的角色设定、剧情上下文、资料规则或世界观依据。
 6. 每个答案只写最终结论，控制在1—3句；依据通常只写1句。不要展开思考过程，避免输出过长而截断。
-7. 只输出下方指定的XML，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
+7. ${reviewEnabledForThisRun ? '必须先完整输出 <stscdev_previous_review>，随后输出 <stscdev_self_check>；两段都不得省略。' : '只输出 <stscdev_self_check>，不得额外输出复盘标签。'}
+8. 除下方指定的XML外，不要输出“无需依据／需要依据”等说明文字、Markdown代码围栏或正文。
 
 严格输出格式：
-<stscdev_self_check>
-<item id="q1"><answer>可独立执行的最终回答</answer></item>
-<item id="q2"><answer>可独立执行的最终回答</answer><evidence>具体依据</evidence></item>
-</stscdev_self_check>
+${requiredOutputSchema}
 
 【当前角色资料】
 ${characterContext}
@@ -1941,7 +1938,7 @@ ${buildDualApiTemporaryContext(temporaryInstructions)}
 
 ${repairDirectives.length ? `【用户确认的本轮修复方向】\n${repairDirectives.map((item, index) => `${index + 1}. ${item}`).join('\n')}\n修复必须承认上一轮已经发生，不得生硬重置剧情。` : ''}
 
-${reviewRequest}
+${reviewEnabledForThisRun ? `【必须完成的上一轮复盘任务】\n${reviewRequest}` : ''}
 `.trim();
 
     const answerStyleInstruction = settings.dualApi.transformFormat
@@ -1949,7 +1946,7 @@ ${reviewRequest}
         : `每个 <answer> 必须完整、明确、自包含，不得只回答“是／否”“会遵照”或使用依赖原文才能理解的模糊指代。`;
 
     const questionPrompt = `
-请现在完成本轮全部自检。回答必须自包含：即使下一步写作模型看不到问题、参考资料原文和你的分析过程，也能仅凭每个 <answer> 准确执行。不得输出正文。
+请现在${reviewEnabledForThisRun ? '先完成上一轮复盘，再完成' : '只完成'}本轮全部自检。回答必须自包含：即使下一步写作模型看不到问题、参考资料原文和你的分析过程，也能仅凭每个 <answer> 准确执行。不得输出正文。
 ${answerStyleInstruction}
 
 本轮问题：
@@ -2132,7 +2129,6 @@ function buildDualApiRawInjection(questions, parsed) {
         `Q${row.index}：${row.question}`,
         `A${row.index}：${row.answer}`,
         row.evidence ? `A${row.index}依据：${row.evidence}` : '',
-        row.source ? `问题来源：${row.source}` : '',
     ].filter(Boolean).join('\n')).join('\n\n');
 
     return `
@@ -2145,25 +2141,27 @@ ${content}
 `.trim();
 }
 
+function yamlQuoted(value) {
+    return JSON.stringify(compactPromptText(value));
+}
+
 function buildDualApiContractInjection(questions, parsed) {
     const rows = dualApiAnswerRows(questions, parsed).filter(row => row.answer);
     if (!rows.length) return '';
 
-    const rules = rows.map(row => {
-        const sourceAttribute = row.source ? ` source="${escapeXml(row.source)}"` : '';
-        return [
-            `<rule index="${row.index}"${sourceAttribute}>`,
-            `<requirement>${wrapXmlCdata(row.answer)}</requirement>`,
-            row.evidence ? `<basis>${wrapXmlCdata(row.evidence)}</basis>` : '',
-            `</rule>`,
-        ].filter(Boolean).join('\n');
-    }).join('\n');
+    const rules = rows.map(row => [
+        `    - instruction: ${yamlQuoted(row.answer)}`,
+        row.evidence ? `      basis: ${yamlQuoted(row.evidence)}` : '',
+    ].filter(Boolean).join('\n')).join('\n');
 
     return `
-<stscdev_execution_contract>
-以下内容是本轮正文必须执行的规则；不得冲突、弱化、绕过，也不得在最终回复中复述或暴露。
+[墨提斯之镜｜本轮写作执行规范]
+以下YAML是本轮正文必须执行的内部规范。不得冲突、弱化或绕过；不得在最终回复中复述、解释或暴露这份规范。
+STSCDEV_EXECUTION_CONTRACT:
+  priority: mandatory
+  disclosure: forbidden
+  rules:
 ${rules}
-</stscdev_execution_contract>
 `.trim();
 }
 
@@ -2536,7 +2534,9 @@ async function handleMessageReceived(data) {
     if (latest.formatIssues?.length) {
         addRuntimeLog('warning', '自检解析', latest.formatIssues.join('；'), `本轮已识别 ${latest.answeredCount}/${latest.expectedCount} 题；异常内容已在当前状态中标记。`);
     }
-    if (latest.previousReview?.issues?.length) {
+    if (latest.previousReview?.status === 'missing') {
+        addRuntimeLog('warning', 'AI复盘', latest.previousReview.reason || '本轮没有读取到上一轮复盘结果。', '本轮自检与正文仍正常完成；下一轮会再次尝试复盘。');
+    } else if (latest.previousReview?.issues?.length) {
         addRuntimeLog('info', 'AI复盘', `发现 ${latest.previousReview.issues.length} 条上一轮疑似问题。`, '已保存到“复盘线索”；只有用户勾选的内容才会影响下一轮。');
     }
 
@@ -2641,6 +2641,7 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
         dualApiBusy = true;
         try {
             const dualQuestions = getDualApiQuestions(settings);
+            const reviewExpected = Boolean(getReviewSource(settings));
             pendingRun.questions = clone(dualQuestions);
             const initialResponse = await callDualApiSelfCheck({
                 chat: _chat,
@@ -2652,9 +2653,11 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
             let rawCheck = initialResponse.text;
             let dualParsed = parseModelOutput(rawCheck, dualQuestions);
             let previousReview = parsePreviousReview(rawCheck);
+            const initialSelfCheckComplete = dualParsedIsComplete(dualParsed, dualQuestions);
+            const initialReviewMissing = reviewExpected && !previousReview;
 
-            if (!dualParsedIsComplete(dualParsed, dualQuestions) && settings.dualApi.retryTransient && initialResponse.attempts === 1) {
-                const firstIncomplete = dualIncompleteMessage(dualParsed, dualQuestions);
+            if ((!initialSelfCheckComplete || initialReviewMissing) && settings.dualApi.retryTransient && initialResponse.attempts === 1) {
+                const firstIncomplete = initialSelfCheckComplete ? '' : dualIncompleteMessage(dualParsed, dualQuestions);
                 try {
                     const retryResponse = await callDualApiSelfCheck({
                         chat: _chat,
@@ -2665,20 +2668,35 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
                     }, { compact: true, allowTransientRetry: false, timeoutSecondsOverride: 60 });
                     const retryRawCheck = retryResponse.text;
                     const retryParsed = parseModelOutput(retryRawCheck, dualQuestions);
-                    if (dualParsedIsComplete(retryParsed, dualQuestions)) {
+                    const retryReview = parsePreviousReview(retryRawCheck);
+                    const retrySelfCheckComplete = dualParsedIsComplete(retryParsed, dualQuestions);
+                    if (retrySelfCheckComplete && (!initialSelfCheckComplete || retryReview)) {
                         rawCheck = retryRawCheck;
                         dualParsed = retryParsed;
-                        previousReview ||= parsePreviousReview(retryRawCheck);
+                        previousReview = retryReview || previousReview;
                         dualParsed.repaired = true;
                         dualParsed.recoveryNotes ||= [];
-                        dualParsed.recoveryNotes.push('首次返回不完整，插件已通过精简上下文重试并取得完整结果。');
+                        dualParsed.recoveryNotes.push(initialSelfCheckComplete
+                            ? '首次返回漏掉上一轮复盘，插件已通过精简上下文重试取得复盘结果。'
+                            : '首次返回不完整，插件已通过精简上下文重试并取得完整自检结果。');
                         if (dualParsed.status === 'ok') dualParsed.status = 'recovered';
-                    } else {
+                    } else if (initialSelfCheckComplete && retryReview) {
+                        previousReview = retryReview;
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push('插件已从精简重试中恢复上一轮复盘，并保留首次返回的完整本轮自检。');
+                    } else if (!initialSelfCheckComplete) {
                         throw new Error(`${firstIncomplete} 精简重试后仍然不完整：${dualIncompleteMessage(retryParsed, dualQuestions)}`);
+                    } else {
+                        dualParsed.recoveryNotes ||= [];
+                        dualParsed.recoveryNotes.push('插件已重试上一轮复盘，但模型仍未返回复盘标签。');
                     }
                 } catch (retryError) {
-                    if (String(retryError?.message || '').startsWith(firstIncomplete)) throw retryError;
-                    throw new Error(`${firstIncomplete} 精简重试失败：${dualApiFailureMessage(retryError)}`);
+                    if (!initialSelfCheckComplete) {
+                        if (String(retryError?.message || '').startsWith(firstIncomplete)) throw retryError;
+                        throw new Error(`${firstIncomplete} 精简重试失败：${dualApiFailureMessage(retryError)}`);
+                    }
+                    dualParsed.recoveryNotes ||= [];
+                    dualParsed.recoveryNotes.push(`上一轮复盘重试失败：${dualApiFailureMessage(retryError)}`);
                 }
             }
 
@@ -2688,6 +2706,14 @@ globalThis.sillyTavernSelfCheckDevInterceptor = async function (_chat, _contextS
             if (dualParsed.status === 'missing') {
                 dualParsed.status = 'format_error';
                 dualParsed.formatIssues.push('独立自检API返回了文本，但没有按要求输出 <stscdev_self_check> 结构。');
+            }
+            if (reviewExpected && !previousReview) {
+                previousReview = {
+                    timestamp: Date.now(),
+                    status: 'missing',
+                    issues: [],
+                    reason: '自检API没有按要求返回 <stscdev_previous_review> 复盘标签；本轮自检与正文仍正常完成。',
+                };
             }
             pendingRun.dualCheck = rawCheck;
             pendingRun.dualParsed = dualParsed;
@@ -3587,7 +3613,8 @@ function renderFloatingCheckPage() {
 
 function renderFloatingReviewPage() {
     const settings = normalizeSettings();
-    const review = getLatestResult()?.previousReview || null;
+    const latest = getLatestResult();
+    const review = latest?.previousReview || null;
     $('#stscdev_floating_title').text('复盘线索');
     if (settings.mode !== 'dual_api' || !settings.dualApi.previousReview) {
         $('#stscdev_floating_subtitle').text('当前未启用');
@@ -3595,8 +3622,18 @@ function renderFloatingReviewPage() {
         return;
     }
     if (!review) {
-        $('#stscdev_floating_subtitle').text('等待第一份复盘结果');
-        $('#stscdev_floating_content').html('<div class="stscdev-empty">暂无可复盘内容。完成至少两轮双API正文生成后，这里会显示上一轮检查结果。</div>');
+        if (latest && latest.mode !== 'dual_api') {
+            $('#stscdev_floating_subtitle').text('上一轮未完成双API');
+            $('#stscdev_floating_content').html('<div class="stscdev-empty">上一轮实际使用了单API，通常是独立自检API失败后自动回退，因此没有生成复盘。请查看运行日志中的“自检API”记录。</div>');
+        } else {
+            $('#stscdev_floating_subtitle').text('已记录首轮，等待下一轮复盘');
+            $('#stscdev_floating_content').html('<div class="stscdev-empty">当前已有一轮可作为复盘来源。请再完成一轮双API正文生成；下一轮自检会先复盘本轮，再进行新的自检。</div>');
+        }
+        return;
+    }
+    if (review.status === 'missing') {
+        $('#stscdev_floating_subtitle').text('本轮复盘未按格式返回');
+        $('#stscdev_floating_content').html(`<div class="stscdev-empty"><b>本轮自检与正文已正常完成</b><br><br>${escapeHtml(review.reason || '自检API没有返回可识别的复盘标签。')}<br><br>插件会在下一轮继续尝试；详情可在运行日志中查看。</div>`);
         return;
     }
     $('#stscdev_floating_subtitle').text(new Date(review.timestamp).toLocaleString());
