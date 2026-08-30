@@ -1,7 +1,7 @@
 const STSC_MODULE = 'sillytavern_self_check_dev';
 const STSC_FOLDER = 'third-party/SillyTavern-Self-Check-Dev';
 const STSC_CHAT_META_KEY = 'sillytavern_self_check_dev_latest';
-const STSC_VERSION = '0.4.0-beta.21';
+const STSC_VERSION = '0.4.0-beta.22';
 const STSC_LOG_LIMIT = 500;
 const STSC_CHECK_TAG = 'stscdev_self_check';
 const STSC_RESPONSE_TAG = 'stscdev_response';
@@ -35,13 +35,14 @@ const STSC_REMOTE_RELEASE_URLS = Object.freeze([
 const STSC_EXTENSION_FOLDER_NAME = 'SillyTavern-Self-Check-Dev';
 const STSC_RELEASE_INFO = Object.freeze({
     version: STSC_VERSION,
-    releasedAt: '2026-08-28',
-    title: '更新检查与大白话运行日志优化',
+    releasedAt: '2026-08-31',
+    title: '正文与思维链边界修复',
     changes: Object.freeze([
-        '更新检查改为 GitHub 原地址、备用 CDN 与 GitHub API 多路尝试，单一路径连不上时仍可继续检查。',
-        '检查失败时会写明哪一步没有成功，并可直接尝试更新或打开酒馆扩展页面。',
-        '每轮生成都会记录角色卡、单/双API模式、自检完成数量、正文是否输出以及复盘结果。',
-        '自检API、格式与更新错误改成大白话说明，明确告诉用户发生了什么以及应该怎么处理。',
+        '单API提示词新增严格输出边界：原有思维链必须先完整闭合，自检和最终正文必须位于思维链标签之外。',
+        '双API普通注入与强力YAML规范同步加入正文边界要求，避免执行规范诱发正文顺序错乱。',
+        '当模型把思维链标签错误地跨过插件自检区并包住正文时，插件会只修复这一处边界，不删除正常思维链。',
+        '运行日志会明确记录“正文误入思维链但已自动分开”，方便判断是已修复的小格式问题还是仍需排查接口。',
+        '若双API正文仍被完整包在思维链中且无法安全自动拆分，日志会明确报警并保留原文，避免误删正文或泄露隐藏推理。',
     ]),
 });
 
@@ -232,6 +233,7 @@ function addRuntimeLog(level, stage, message, handling = '') {
 
 function plainSelfCheckIssue(issue) {
     const text = String(issue || '');
+    if (/整段可见回复.*思维链|最终正文.*推理标签/.test(text)) return '正文AI把整段可见回复都放进了思维链，插件无法安全猜出里面哪一段才是正文，所以没有强行删除内容。';
     if (/酒馆主API.*重复输出|意外重复输出/.test(text)) return '正文AI把插件内部自检也写进了正文，插件已经自动删掉。';
     if (/结束标签缺失|没有正确闭合|自动补全/.test(text)) return '自检内容的结尾格式没有写完整，插件已经自动补齐。';
     if (/没有按要求输出.*stscdev_self_check|没有检测到|没有输出|未输出|完全没有/.test(text)) return 'AI没有输出插件能够识别的自检内容。';
@@ -253,6 +255,7 @@ function addGenerationResultLog(latest, visibleBody = '') {
     const countText = expected ? `${answered}/${expected} 题` : `${answered} 题`;
     const hasBody = Boolean(String(visibleBody || '').trim());
     const formatDetails = (latest.formatIssues || []).map(plainSelfCheckIssue).filter(Boolean);
+    const repairedReasoningBoundary = (latest.recoveryNotes || []).some(note => /正文.*思维链|推理标签.*正文/.test(String(note)));
     const handlingParts = [`本轮使用${mode}模式。`];
     let level = 'info';
     let message = '';
@@ -272,7 +275,9 @@ function addGenerationResultLog(latest, visibleBody = '') {
         if (formatDetails.length) handlingParts.push(`具体情况：${formatDetails.join('；')}`);
     } else if (latest.status === 'recovered') {
         message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
-        handlingParts.push('AI最初的格式有小问题，插件已经自动修好，无需手动处理。');
+        handlingParts.push(repairedReasoningBoundary
+            ? 'AI原本把自检和正文一起包进了思维链，插件已经自动把正文分到思维链外，无需手动处理。'
+            : 'AI最初的格式有小问题，插件已经自动修好，无需手动处理。');
     } else {
         message = `${character}：自检输出完成，共完成 ${countText}，正文也已正常输出。`;
         handlingParts.push('本轮运行正常，无需处理。');
@@ -1699,27 +1704,28 @@ function buildSinglePrompt(questions) {
 [墨提斯之镜 DEV 插件｜强制执行]
 你必须在输出任何角色扮演正文、对白、动作描写、状态栏、HTML、XML或其他正常正文格式之前，完成下面全部自检问题。
 
-兼容规则：
-- 本插件不得压制、替换、改写或省略用户预设、模型接口或 SillyTavern 原本要求的 thinking / reasoning 内容。
-- 如果原预设要求先输出 <thinking>、<think>、<reasoning> 或其他推理块，请先按原规则完整输出该推理块；随后输出插件自检；最后再输出正文。
-- <stscdev_self_check> 只需位于正文之前，不要求位于原生思维链或推理块之前。
+输出边界（必须严格遵守）：
+- 本插件不要求你新增、展示或改写任何模型内部推理。
+- 仅当当前接口或预设原本明确要求输出可见推理区时，才按其原规则输出；必须在插件自检开始前完整关闭全部推理标签。
+- <stscdev_self_check> 和最终可见正文必须位于 <think>、<thinking>、<reasoning>、<analysis> 及同类推理标签之外，绝不能被这些标签包裹。
+- 固定顺序只能是：原规则要求的可见推理区（如有且已闭合）→ 插件自检 → 最终可见正文。
 
 执行规则：
 1. 先依据当前角色卡、世界观、聊天记录和用户最后一条消息，逐题形成最终写作结论。
 2. 检查你准备输出的正文是否与任一答案冲突；如有冲突，先修正写作方案，再重新核对。
-3. 自检区只输出最终可供核对的简洁答案，不得把插件问答混入原生 thinking / reasoning 区域。
+3. 自检区只输出最终可供核对的简洁答案，不得把插件问答放入任何推理区。
 4. 不得漏题、合并题目或改变题目编号。
-5. 自检完成前不得开始角色扮演正文；原预设要求的思维链或推理块不属于正文，可正常位于自检之前。
+5. 自检完成前不得开始角色扮演正文；自检结束后直接开始可见正文，不得再用推理标签包住正文。
 6. 对标记 evidence_required="true" 的问题，必须在同一个<item>中同时输出非空的<answer>与<evidence>；缺少<evidence>即视为格式错误。
 7. <answer>只写最终结论与本轮演绎方案；<evidence>单独写支撑该结论的具体剧情、角色设定或世界观依据。
 
 你必须严格输出以下结构：
-（如原预设要求，先正常输出其 thinking / reasoning 内容）
+（仅当原规则明确要求时：先输出并完整闭合其可见推理区；否则不要新增）
 <stscdev_self_check>
 无需依据：<item id="q1"><answer>最终回答</answer></item>
 需要依据：<item id="q2"><answer>最终回答</answer><evidence>具体依据</evidence></item>
 </stscdev_self_check>
-紧接着直接输出正文、状态栏以及用户要求的全部正常输出格式。
+紧接着在全部推理标签之外直接输出正文、状态栏以及用户要求的全部正常输出格式。
 正文不得再包裹在任何由本插件添加的标签中。
 
 本轮问题：
@@ -2209,6 +2215,8 @@ function buildDualApiRawInjection(questions, parsed) {
 [墨提斯之镜｜本轮已完成独立自检]
 以下内容是我在生成正文前已经完成的本轮自检结论。接下来必须依据这些结论继续写作，不得忽略、否定或绕过；不要在最终回复中重复、解释或展示自检内容。
 
+输出边界：本插件不要求新增或展示思维链。若当前接口或预设原本要求可见推理区，必须先完整关闭推理标签；最终可见正文必须位于 <think>、<thinking>、<reasoning>、<analysis> 及同类推理标签之外。
+
 ${content}
 
 现在依据以上结论，按照当前角色卡、酒馆预设、世界观和用户最后一条消息生成最终正文。
@@ -2234,6 +2242,10 @@ function buildDualApiContractInjection(questions, parsed) {
 STSCDEV_EXECUTION_CONTRACT:
   priority: mandatory
   disclosure: forbidden
+  output_boundary:
+    require_new_reasoning: false
+    close_visible_reasoning_before_final: true
+    final_visible_response_outside_reasoning: true
   rules:
 ${rules}
 `.trim();
@@ -2397,6 +2409,89 @@ function removeSelfCheckBlocks(text) {
         .trim();
 }
 
+function unmatchedVisibleReasoningTags(text) {
+    const stack = [];
+    const tagPattern = /<\/?(think|thinking|reasoning|analysis)\b[^>]*>/gi;
+    for (const match of String(text ?? '').matchAll(tagPattern)) {
+        const rawTag = match[0];
+        const tag = match[1].toLowerCase();
+        if (/^<\//.test(rawTag)) {
+            const matchingOpen = stack.lastIndexOf(tag);
+            if (matchingOpen >= 0) stack.splice(matchingOpen, 1);
+        } else if (!/\/\s*>$/.test(rawTag)) {
+            stack.push(tag);
+        }
+    }
+    return stack;
+}
+
+function removeFirstOrphanReasoningClose(text, tag) {
+    const source = String(text ?? '');
+    const tagPattern = new RegExp(`<\\/?${tag}\\b[^>]*>`, 'gi');
+    let nestedDepth = 0;
+    let match;
+    while ((match = tagPattern.exec(source)) !== null) {
+        const rawTag = match[0];
+        if (/^<\//.test(rawTag)) {
+            if (nestedDepth === 0) {
+                return `${source.slice(0, match.index)}${source.slice(match.index + rawTag.length)}`;
+            }
+            nestedDepth -= 1;
+        } else if (!/\/\s*>$/.test(rawTag)) {
+            nestedDepth += 1;
+        }
+    }
+    return source;
+}
+
+function repairReasoningBoundaryAroundSelfCheck(text) {
+    const source = String(text ?? '');
+    const openMatch = STSC_CHECK_OPEN_RE.exec(source);
+    if (!openMatch) return { text: source, repairedTags: [] };
+
+    const afterOpenStart = openMatch.index + openMatch[0].length;
+    const afterOpen = source.slice(afterOpenStart);
+    const closeMatch = STSC_CHECK_CLOSE_RE.exec(afterOpen);
+    if (!closeMatch) return { text: source, repairedTags: [] };
+
+    const closeEnd = afterOpenStart + closeMatch.index + closeMatch[0].length;
+    const prefix = source.slice(0, openMatch.index);
+    const selfCheckBlock = source.slice(openMatch.index, closeEnd);
+    let suffix = source.slice(closeEnd);
+    const activeTags = unmatchedVisibleReasoningTags(prefix);
+    if (!activeTags.length) return { text: source, repairedTags: [] };
+
+    const closingOrder = activeTags.slice().reverse();
+    for (const tag of closingOrder) suffix = removeFirstOrphanReasoningClose(suffix, tag);
+    const boundary = `${prefix && !/\s$/.test(prefix) ? '\n' : ''}${closingOrder.map(tag => `</${tag}>`).join('\n')}\n`;
+    return {
+        text: `${prefix}${boundary}${selfCheckBlock}${suffix}`,
+        repairedTags: [...new Set(closingOrder)],
+    };
+}
+
+function visibleResponseReasoningWrapper(text) {
+    const source = String(text ?? '').trim();
+    const openMatch = /^<(think|thinking|reasoning|analysis)\b[^>]*>/i.exec(source);
+    if (!openMatch) return '';
+
+    const tag = openMatch[1].toLowerCase();
+    const tagPattern = new RegExp(`<\\/?${tag}\\b[^>]*>`, 'ig');
+    let depth = 0;
+    let match;
+    while ((match = tagPattern.exec(source)) !== null) {
+        if (/^<\//.test(match[0])) {
+            depth -= 1;
+            if (depth === 0) {
+                return source.slice(match.index + match[0].length).trim() ? '' : tag;
+            }
+        } else if (!/\/\s*>$/.test(match[0])) {
+            depth += 1;
+        }
+    }
+    return tag;
+}
+
 function extractVisibleBody(text) {
     // 自检标签未闭合时不做破坏性裁切，避免误吞原生思维链或后续正文。
     return removeSelfCheckBlocks(text);
@@ -2404,7 +2499,8 @@ function extractVisibleBody(text) {
 
 function parseModelOutput(text, expectedQuestions = []) {
     const normalized = normalizeModelXmlText(text);
-    const source = normalized.source;
+    const reasoningBoundaryRepair = repairReasoningBoundaryAroundSelfCheck(normalized.source);
+    const source = reasoningBoundaryRepair.text;
     const openMatch = STSC_CHECK_OPEN_RE.exec(source);
     const closeMatch = STSC_CHECK_CLOSE_RE.exec(source);
     const result = {
@@ -2434,6 +2530,10 @@ function parseModelOutput(text, expectedQuestions = []) {
     if (normalized.decodedOuterXml) {
         result.repaired = true;
         result.recoveryNotes.push('自检XML被转义，插件已自动还原后解析。');
+    }
+    if (reasoningBoundaryRepair.repairedTags.length) {
+        result.repaired = true;
+        result.recoveryNotes.push('AI把正文错误包在思维链标签内，插件已在自检开始前闭合推理区，并把正文保留在思维链外。');
     }
     result.rawCheck = inner;
     result.items = parseItems(inner);
@@ -2483,6 +2583,11 @@ function parseModelOutput(text, expectedQuestions = []) {
 
     if (result.items.length !== expectedQuestions.length) {
         result.formatIssues.push(`应回答 ${expectedQuestions.length} 题，实际识别到 ${result.items.length} 题。`);
+    }
+
+    const reasoningWrapper = visibleResponseReasoningWrapper(result.body);
+    if (reasoningWrapper) {
+        result.formatIssues.push(`最终正文仍被 <${reasoningWrapper}> 推理标签包裹；插件无法安全判断标签内部的正文起点，因此没有强行删除内容。`);
     }
 
     result.status = result.formatIssues.length ? 'format_error' : (result.repaired ? 'recovered' : 'ok');
@@ -2615,9 +2720,16 @@ async function handleMessageReceived(data) {
             statusOverride: dualStatus,
         });
         latest.previousReview = run.previousReview || null;
+        const mainReasoningWrapper = visibleResponseReasoningWrapper(body);
+        if (mainReasoningWrapper) {
+            latest.formatIssues.push(`酒馆主API把整段可见回复放进了 <${mainReasoningWrapper}> 思维链标签；插件无法安全判断正文起点，因此没有强行删除内容。`);
+            latest.status = 'format_error';
+            latest.issueViewed = false;
+        }
         if (mainParsed.status !== 'missing') {
             latest.formatIssues.push('酒馆主API意外重复输出了自检内容，插件已自动移除。');
             if (latest.status === 'dual_ok') latest.status = 'format_error';
+            latest.issueViewed = false;
         }
     } else {
         parsed = parseModelOutput(rawText, questions);
